@@ -1,8 +1,9 @@
 """Desktop / directory file organiser.
 
 Scans any directory (defaults to the user's Desktop), categorises every
-file by its extension, and moves files into tidy sub-directories — keeping
-the desktop *organised*.
+file by its extension, and moves files into tidy sub-directories inside
+the configured install directory (``D:\\AI-Helper\\Organized`` on Windows
+by default) — keeping the desktop *organised* and free of clutter.
 
 All operations support a *dry_run* mode that reports what *would* happen
 without touching any files.
@@ -16,6 +17,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from . import config as _cfg
 
 logger = logging.getLogger(__name__)
 
@@ -224,11 +227,21 @@ class OrganiseResult:
 class FileOrganizer:
     """Organise files in a directory into categorised sub-folders.
 
+    Files are moved *from* :attr:`target_dir` (the Desktop by default)
+    *into* :attr:`downloads_dir` (``D:\\AI-Helper\\Organized`` on Windows
+    by default) so that the Desktop stays clean and all organised content
+    lives on the D drive where space is not constrained.
+
     Parameters
     ----------
     target_dir:
-        Directory to organise.  Defaults to the user's Desktop
-        (``~/Desktop``).
+        Directory to scan for files to organise.  Defaults to the user's
+        Desktop (``~/Desktop``).
+    downloads_dir:
+        Root destination directory where categorised sub-folders are
+        created.  Defaults to :func:`ai_helper.config.get_organized_dir`
+        (``D:\\AI-Helper\\Organized`` on Windows, ``~/AI-Helper/Organized``
+        elsewhere).  Pass an explicit path to override.
     dry_run:
         When ``True``, compute and report what *would* happen without
         actually moving any files.
@@ -243,11 +256,14 @@ class FileOrganizer:
     def __init__(
         self,
         target_dir: Optional[Path] = None,
+        downloads_dir: Optional[Path] = None,
         dry_run: bool = False,
         recursive: bool = False,
         custom_map: Optional[Dict[str, FileCategory]] = None,
     ) -> None:
         self.target_dir = target_dir or (Path.home() / "Desktop")
+        # All organised files land on the D drive (or configured install dir).
+        self.downloads_dir: Path = downloads_dir or _cfg.get_organized_dir()
         self.dry_run = dry_run
         self.recursive = recursive
         self._ext_map: Dict[str, FileCategory] = {**EXTENSION_MAP, **(custom_map or {})}
