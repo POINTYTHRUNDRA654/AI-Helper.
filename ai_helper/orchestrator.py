@@ -1,7 +1,9 @@
 """Orchestrator.
 
 Wires the :class:`~ai_helper.monitor.SystemMonitor`,
-:class:`~ai_helper.process_manager.ProcessManager` and
+:class:`~ai_helper.process_manager.ProcessManager`,
+:class:`~ai_helper.gpu_monitor.GpuMonitor`,
+:class:`~ai_helper.ai_integrations.AIAppRegistry` and
 :class:`~ai_helper.communicator.Communicator` together into a single
 polling loop that keeps the desktop *running smooth*, *organised* and
 *communicating*.
@@ -14,7 +16,9 @@ import threading
 import time
 from typing import Optional
 
+from .ai_integrations import AIAppRegistry
 from .communicator import Communicator
+from .gpu_monitor import GpuMonitor
 from .monitor import SystemMonitor, SystemSnapshot
 from .process_manager import ProcessManager
 
@@ -34,6 +38,10 @@ class Orchestrator:
         Optional pre-configured :class:`~ai_helper.process_manager.ProcessManager`.
     communicator:
         Optional pre-configured :class:`~ai_helper.communicator.Communicator`.
+    gpu_monitor:
+        Optional pre-configured :class:`~ai_helper.gpu_monitor.GpuMonitor`.
+    ai_registry:
+        Optional pre-configured :class:`~ai_helper.ai_integrations.AIAppRegistry`.
     """
 
     def __init__(
@@ -42,11 +50,15 @@ class Orchestrator:
         monitor: Optional[SystemMonitor] = None,
         process_manager: Optional[ProcessManager] = None,
         communicator: Optional[Communicator] = None,
+        gpu_monitor: Optional[GpuMonitor] = None,
+        ai_registry: Optional[AIAppRegistry] = None,
     ) -> None:
         self.poll_interval = poll_interval
         self.monitor = monitor or SystemMonitor()
         self.process_manager = process_manager or ProcessManager()
         self.communicator = communicator or Communicator()
+        self.gpu_monitor = gpu_monitor or GpuMonitor()
+        self.ai_registry = ai_registry or AIAppRegistry()
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -87,6 +99,8 @@ class Orchestrator:
         """Run a single monitoring cycle synchronously."""
         self._check_system()
         self._check_processes()
+        self._check_gpu()
+        self._check_ai_apps()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -126,3 +140,21 @@ class Orchestrator:
             )
             logger.warning("PROCESS ALERT: %s", msg)
             self.communicator.alert(msg, source="process_manager", urgency="normal", topic="process_alert")
+
+    def _check_gpu(self) -> None:
+        if not self.gpu_monitor.available:
+            return
+        snaps = self.gpu_monitor.snapshots()
+        if snaps:
+            self.communicator.publish("gpu", snaps, source="gpu_monitor")
+            logger.debug("%s", self.gpu_monitor.format_snapshots(snaps))
+        for alert_msg in self.gpu_monitor.alerts(snaps):
+            logger.warning("GPU ALERT: %s", alert_msg)
+            self.communicator.alert(alert_msg, source="gpu_monitor", urgency="critical", topic="gpu_alert")
+
+    def _check_ai_apps(self) -> None:
+        running_apps = self.ai_registry.running()
+        if running_apps:
+            self.communicator.publish("ai_apps", running_apps, source="ai_registry")
+            names = ", ".join(s.name for s in running_apps)
+            logger.debug("Running AI apps: %s", names)

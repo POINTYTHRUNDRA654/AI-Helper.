@@ -14,6 +14,23 @@ Speak every alert aloud::
 
     python -m ai_helper --daemon --voice
 
+Show GPU stats::
+
+    python -m ai_helper --gpu-stats
+
+List all discovered AI programs::
+
+    python -m ai_helper --list-ai
+
+Ask Ollama a question::
+
+    python -m ai_helper --ollama-ask "What is the capital of France?" --ollama-model llama3
+
+Install / uninstall the auto-start service::
+
+    python -m ai_helper --install-service
+    python -m ai_helper --uninstall-service
+
 Options
 -------
 --daemon              Run as a background polling loop.
@@ -25,6 +42,14 @@ Options
 --voice-rate WPM      Speech rate in words per minute (default: 175).
 --voice-volume VOL    Speech volume 0.0–1.0 (default: 1.0).
 --list-voices         Print available TTS voices and exit.
+--gpu-stats           Print NVIDIA GPU stats and exit.
+--list-ai             Discover and print status of all known AI programs.
+--ollama-ask TEXT     Send a one-shot prompt to Ollama and print the reply.
+--ollama-model MODEL  Ollama model to use with --ollama-ask (default: llama3).
+--ollama-url URL      Ollama base URL (default: http://localhost:11434).
+--install-service     Install AI Helper as a boot-time auto-start service.
+--uninstall-service   Remove the auto-start service.
+--service-status      Show the current service installation status.
 --log-level LEVEL     Logging level: DEBUG, INFO, WARNING, ERROR (default: INFO).
 """
 
@@ -36,10 +61,13 @@ import signal
 import sys
 import time
 
+from .ai_integrations import AIAppRegistry, OllamaClient
 from .communicator import Communicator, Message
+from .gpu_monitor import GpuMonitor
 from .monitor import SystemMonitor
 from .orchestrator import Orchestrator
 from .process_manager import ProcessManager
+from .service import ServiceManager
 from .voice import Speaker, VoiceSettings
 
 
@@ -58,6 +86,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--voice-rate", type=int, default=175, metavar="WPM", help="Speech rate in words-per-minute (default: 175).")
     parser.add_argument("--voice-volume", type=float, default=1.0, metavar="VOL", help="Speech volume 0.0–1.0 (default: 1.0).")
     parser.add_argument("--list-voices", action="store_true", help="List available TTS voices and exit.")
+    # GPU options
+    parser.add_argument("--gpu-stats", action="store_true", help="Print NVIDIA GPU stats and exit.")
+    # AI program options
+    parser.add_argument("--list-ai", action="store_true", help="Discover and list all known AI programs.")
+    parser.add_argument("--ollama-ask", metavar="TEXT", help="Send a prompt to Ollama and print the reply.")
+    parser.add_argument("--ollama-model", default="llama3", metavar="MODEL", help="Ollama model for --ollama-ask (default: llama3).")
+    parser.add_argument("--ollama-url", default="http://localhost:11434", metavar="URL", help="Ollama base URL.")
+    # Service options
+    parser.add_argument("--install-service", action="store_true", help="Install AI Helper as a boot-time auto-start service.")
+    parser.add_argument("--uninstall-service", action="store_true", help="Remove the auto-start service.")
+    parser.add_argument("--service-status", action="store_true", help="Show current service installation status.")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging verbosity (default: INFO).")
     return parser
 
@@ -88,6 +127,58 @@ def main(argv: list[str] | None = None) -> None:  # noqa: UP006
                 print(f"  {v}")
         else:
             print("No pyttsx3 voices found (is pyttsx3 installed?).")
+        return
+
+    # ------------------------------------------------------------------
+    # Service management (early exit)
+    # ------------------------------------------------------------------
+    if args.install_service or args.uninstall_service or args.service_status:
+        svc = ServiceManager()
+        if args.install_service:
+            ok = svc.install()
+            print("Service installed." if ok else "Service installation failed — check logs.")
+        elif args.uninstall_service:
+            ok = svc.uninstall()
+            print("Service removed." if ok else "Service removal failed — check logs.")
+        else:
+            print(svc.status())
+        return
+
+    # ------------------------------------------------------------------
+    # GPU stats (early exit)
+    # ------------------------------------------------------------------
+    if args.gpu_stats:
+        gpu = GpuMonitor()
+        print(gpu.format_snapshots())
+        alerts = gpu.alerts()
+        if alerts:
+            print("\nGPU Alerts:")
+            for a in alerts:
+                print(f"  ⚠  {a}")
+        return
+
+    # ------------------------------------------------------------------
+    # AI program discovery (early exit)
+    # ------------------------------------------------------------------
+    if args.list_ai:
+        registry = AIAppRegistry()
+        print(registry.format_status())
+        return
+
+    # ------------------------------------------------------------------
+    # Ollama one-shot query (early exit)
+    # ------------------------------------------------------------------
+    if args.ollama_ask:
+        client = OllamaClient(base_url=args.ollama_url)
+        if not client.is_running():
+            print(f"Ollama is not running at {args.ollama_url}")
+            print("Start it with: ollama serve")
+            return
+        print(f"Asking {args.ollama_model}: {args.ollama_ask!r} …", flush=True)
+        result = client.generate(model=args.ollama_model, prompt=args.ollama_ask)
+        print(result.response)
+        if args.voice:
+            speaker.speak_now(result.response)
         return
 
     # ------------------------------------------------------------------
