@@ -1,6 +1,6 @@
 """Inter-process communicator.
 
-Provides two complementary communication mechanisms:
+Provides three complementary communication mechanisms:
 
 1. **Message bus** – an in-process publish/subscribe bus so that the
    modules inside AI Helper can exchange typed messages without tight
@@ -9,6 +9,10 @@ Provides two complementary communication mechanisms:
 2. **Desktop notifications** – a thin wrapper that emits a desktop
    notification (via ``notify-send`` on Linux, ``osascript`` on macOS, or
    ``msg`` on Windows) so the user can see alerts without a GUI window.
+
+3. **Voice** – the :class:`~ai_helper.voice.Speaker` is integrated into
+   the :class:`Communicator` façade so that every alert is also *spoken
+   aloud* when voice is enabled (``speak_alerts=True``).
 """
 
 from __future__ import annotations
@@ -163,15 +167,43 @@ class Notifier:
 
 
 class Communicator:
-    """Combines the :class:`MessageBus` and :class:`Notifier` into one object.
+    """Combines the :class:`MessageBus`, :class:`Notifier` and
+    :class:`~ai_helper.voice.Speaker` into one object.
 
     The orchestrator and other modules interact with this single object to
-    both route internal messages and surface alerts to the user.
+    route internal messages, surface alerts to the user, and *speak* them
+    aloud when voice is enabled.
+
+    Parameters
+    ----------
+    app_name:
+        Application name shown in desktop notifications.
+    speaker:
+        Optional pre-constructed :class:`~ai_helper.voice.Speaker`.  When
+        *None* and *speak_alerts* is ``True`` a default ``Speaker`` is
+        created automatically.
+    speak_alerts:
+        When ``True`` (default ``False``), every call to :meth:`alert`
+        will also be spoken aloud via the :attr:`speaker`.
     """
 
-    def __init__(self, app_name: str = "AI Helper") -> None:
+    def __init__(
+        self,
+        app_name: str = "AI Helper",
+        speaker=None,  # type: ignore[assignment]  # Optional[Speaker]
+        speak_alerts: bool = False,
+    ) -> None:
         self.bus = MessageBus()
         self.notifier = Notifier(app_name=app_name)
+        self.speak_alerts = speak_alerts
+
+        if speaker is not None:
+            self.speaker = speaker
+        elif speak_alerts:
+            from .voice import Speaker  # lazy import avoids hard dep when voice unused
+            self.speaker = Speaker()
+        else:
+            self.speaker = None
 
     def alert(
         self,
@@ -180,9 +212,12 @@ class Communicator:
         urgency: str = "normal",
         topic: str = "alert",
     ) -> None:
-        """Publish an alert on the bus **and** send a desktop notification."""
+        """Publish an alert on the bus, send a desktop notification,
+        and speak the message aloud when voice is enabled."""
         self.bus.publish(Message(topic=topic, payload=message, source=source))
         self.notifier.notify(title=source, message=message, urgency=urgency)
+        if self.speak_alerts and self.speaker is not None:
+            self.speaker.speak(f"{source}. {message}")
 
     def publish(self, topic: str, payload: Any, source: str = "ai_helper") -> None:
         """Publish an arbitrary message on the internal bus."""

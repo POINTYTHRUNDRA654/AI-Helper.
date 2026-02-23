@@ -293,7 +293,7 @@ class FileOrganizer:
                 continue
 
             category = self._categorise(path)
-            dest_dir = self.target_dir / category.value
+            dest_dir = self.downloads_dir / category.value
             dest = self._unique_dest(dest_dir, path.name)
 
             record = MoveRecord(source=path, destination=dest, category=category, dry_run=self.dry_run)

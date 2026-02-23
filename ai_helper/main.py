@@ -10,6 +10,10 @@ Run the continuous monitoring daemon (Ctrl-C to stop)::
 
     python -m ai_helper --daemon
 
+Speak every alert aloud::
+
+    python -m ai_helper --daemon --voice
+
 Options
 -------
 --daemon              Run as a background polling loop.
@@ -17,6 +21,10 @@ Options
 --cpu-threshold PCT   CPU % to alert on (default: 85).
 --mem-threshold PCT   Memory % to alert on (default: 85).
 --disk-threshold PCT  Disk % to alert on (default: 90).
+--voice               Enable text-to-speech for all alerts.
+--voice-rate WPM      Speech rate in words per minute (default: 175).
+--voice-volume VOL    Speech volume 0.0–1.0 (default: 1.0).
+--list-voices         Print available TTS voices and exit.
 --log-level LEVEL     Logging level: DEBUG, INFO, WARNING, ERROR (default: INFO).
 """
 
@@ -32,6 +40,7 @@ from .communicator import Communicator, Message
 from .monitor import SystemMonitor
 from .orchestrator import Orchestrator
 from .process_manager import ProcessManager
+from .voice import Speaker, VoiceSettings
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -44,6 +53,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cpu-threshold", type=float, default=85.0, metavar="PCT", help="CPU alert threshold %% (default: 85).")
     parser.add_argument("--mem-threshold", type=float, default=85.0, metavar="PCT", help="Memory alert threshold %% (default: 85).")
     parser.add_argument("--disk-threshold", type=float, default=90.0, metavar="PCT", help="Disk alert threshold %% (default: 90).")
+    # Voice options
+    parser.add_argument("--voice", action="store_true", help="Speak alerts aloud using text-to-speech.")
+    parser.add_argument("--voice-rate", type=int, default=175, metavar="WPM", help="Speech rate in words-per-minute (default: 175).")
+    parser.add_argument("--voice-volume", type=float, default=1.0, metavar="VOL", help="Speech volume 0.0–1.0 (default: 1.0).")
+    parser.add_argument("--list-voices", action="store_true", help="List available TTS voices and exit.")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging verbosity (default: INFO).")
     return parser
 
@@ -58,6 +72,27 @@ def main(argv: list[str] | None = None) -> None:  # noqa: UP006
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    # ------------------------------------------------------------------
+    # Voice / TTS setup
+    # ------------------------------------------------------------------
+    speaker = Speaker(
+        settings=VoiceSettings(rate=args.voice_rate, volume=args.voice_volume),
+        enabled=args.voice,
+    )
+
+    if args.list_voices:
+        voices = speaker.list_voices()
+        if voices:
+            print("Available TTS voices:")
+            for v in voices:
+                print(f"  {v}")
+        else:
+            print("No pyttsx3 voices found (is pyttsx3 installed?).")
+        return
+
+    # ------------------------------------------------------------------
+    # Core modules
+    # ------------------------------------------------------------------
     monitor = SystemMonitor(
         thresholds={
             "cpu": args.cpu_threshold,
@@ -66,7 +101,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: UP006
         }
     )
     process_manager = ProcessManager()
-    communicator = Communicator()
+    communicator = Communicator(speaker=speaker, speak_alerts=args.voice)
 
     # Echo every alert to stdout so the user sees it even without a desktop.
     def _print_alert(msg: Message) -> None:
@@ -87,9 +122,14 @@ def main(argv: list[str] | None = None) -> None:  # noqa: UP006
             print("\nAlerts:")
             for a in alerts:
                 print(f"  ⚠  {a}")
+            if args.voice:
+                for a in alerts:
+                    speaker.speak_now(a)
         return
 
+    # ------------------------------------------------------------------
     # Daemon mode
+    # ------------------------------------------------------------------
     orchestrator = Orchestrator(
         poll_interval=args.interval,
         monitor=monitor,
@@ -97,9 +137,15 @@ def main(argv: list[str] | None = None) -> None:  # noqa: UP006
         communicator=communicator,
     )
 
+    if args.voice:
+        speaker.speak_now("AI Helper started.")
+
     def _handle_signal(signum: int, _frame: object) -> None:
         print("\nShutting down AI Helper…", flush=True)
+        if args.voice:
+            speaker.speak_now("AI Helper shutting down.")
         orchestrator.stop()
+        speaker.shutdown()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _handle_signal)

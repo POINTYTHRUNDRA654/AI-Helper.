@@ -138,22 +138,33 @@ class AnomalyDetector:
     def observe(self, metric: str, value: float) -> Optional[Anomaly]:
         """Record a new *value* for *metric* and return an :class:`Anomaly` if detected."""
         win = self._window(metric)
+
+        # Capture the current baseline BEFORE updating the window so that the
+        # incoming value is scored against the model, not contaminated by it.
+        prev_ewma = win.ewma
+        prev_ewma_std = win.ewma_std
+
         win.push(value)
 
-        if len(win) < self.min_samples or win.ewma is None:
+        if len(win) < self.min_samples or prev_ewma is None:
             return None
 
-        std = win.ewma_std
+        # Prefer EWMA-based std; fall back to rolling population stdev when the
+        # EWMA variance is still near zero (e.g. all training values identical).
+        std = prev_ewma_std if prev_ewma_std >= 1e-6 else win.stdev()
+
+        # When the signal is perfectly constant (std ≈ 0), treat 5% of the
+        # mean as a reasonable noise floor so genuine spikes are still caught.
         if std < 1e-6:
-            return None
+            std = max(abs(prev_ewma) * 0.05, 1e-3)
 
-        z = (value - win.ewma) / std
+        z = (value - prev_ewma) / std
         if abs(z) >= self.z_threshold:
             return Anomaly(
                 metric=metric,
                 value=value,
                 z_score=z,
-                ewma=win.ewma,
+                ewma=prev_ewma,
                 ewma_std=std,
             )
         return None
