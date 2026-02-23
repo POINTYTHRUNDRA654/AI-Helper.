@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-helper"
+version = "0.1.0"
+description = "AI Helper – keep your Windows desktop running smooth, organised and communicating."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "psutil>=5.9.0",
+    "pyttsx3>=2.90",
+    "pynput>=1.8.1",
+    "pyperclip>=1.11.0",
+]
+
+[project.optional-dependencies]
+gpu = ["pynvml"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+ai-helper = "ai_helper.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ai_helper*"]
