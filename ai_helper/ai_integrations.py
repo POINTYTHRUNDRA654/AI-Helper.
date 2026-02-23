@@ -364,3 +364,292 @@ class AIAppRegistry:
         """Add a custom AI program to the registry at runtime."""
         self._apps.append((name, health_url, version_url))
         logger.debug("Registered AI app %r at %s", name, health_url)
+
+
+# ---------------------------------------------------------------------------
+# LM Studio client (OpenAI-compatible)
+# ---------------------------------------------------------------------------
+
+
+class LMStudioClient:
+    """Interact with a running LM Studio server (OpenAI-compatible API).
+
+    Parameters
+    ----------
+    base_url:
+        LM Studio server base URL (default ``http://localhost:1234``).
+    """
+
+    def __init__(self, base_url: str = "http://localhost:1234") -> None:
+        self.base_url = base_url.rstrip("/")
+
+    def is_running(self) -> bool:
+        return _reachable(f"{self.base_url}/v1/models")
+
+    def status(self) -> AIAppStatus:
+        running = self.is_running()
+        return AIAppStatus(name="LM Studio", url=self.base_url, running=running)
+
+    def list_models(self) -> List[str]:
+        """Return model IDs available in LM Studio."""
+        data = _get(f"{self.base_url}/v1/models")
+        if not data:
+            return []
+        return [m.get("id", "") for m in data.get("data", [])]
+
+    def chat(
+        self,
+        prompt: str,
+        model: str = "",
+        system: str = "You are a helpful AI assistant.",
+        temperature: float = 0.7,
+        timeout: float = 120.0,
+    ) -> GenerateResult:
+        """Send a chat message and return the response.
+
+        Parameters
+        ----------
+        prompt:
+            User message text.
+        model:
+            Model ID to use.  If empty, LM Studio uses whichever is loaded.
+        system:
+            System prompt.
+        temperature:
+            Sampling temperature (0.0–2.0).
+        """
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "temperature": temperature,
+            "stream": False,
+        }
+        if model:
+            payload["model"] = model
+
+        result = _post(f"{self.base_url}/v1/chat/completions", payload, timeout=timeout)
+        if result is None:
+            return GenerateResult(model=model, prompt=prompt, response="", done=False,
+                                  error="No response from LM Studio (is it running?)")
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return GenerateResult(model=model, prompt=prompt, response=content, done=True)
+
+
+# ---------------------------------------------------------------------------
+# ComfyUI client
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ComfyUIJob:
+    """A queued or completed ComfyUI workflow job."""
+    prompt_id: str
+    status: str   # "pending" | "running" | "complete" | "error"
+    outputs: Dict[str, Any] = field(default_factory=dict)
+
+
+class ComfyUIClient:
+    """Interact with a running ComfyUI server.
+
+    Parameters
+    ----------
+    base_url:
+        ComfyUI server base URL (default ``http://localhost:8188``).
+    """
+
+    def __init__(self, base_url: str = "http://localhost:8188") -> None:
+        self.base_url = base_url.rstrip("/")
+
+    def is_running(self) -> bool:
+        return _reachable(f"{self.base_url}/system_stats")
+
+    def status(self) -> AIAppStatus:
+        data = _get(f"{self.base_url}/system_stats")
+        running = data is not None
+        version = str(data.get("system", {}).get("comfyui_version", "")) if data else ""
+        return AIAppStatus(name="ComfyUI", url=self.base_url, running=running, version=version)
+
+    def queue_prompt(self, workflow: Dict[str, Any], client_id: str = "ai-helper") -> Optional[str]:
+        """Queue a ComfyUI workflow for execution.
+
+        Parameters
+        ----------
+        workflow:
+            A ComfyUI API-format workflow dict (the ``"prompt"`` payload).
+        client_id:
+            Client identifier string (used to track job status).
+
+        Returns
+        -------
+        str or None
+            The ``prompt_id`` string if queued successfully, else ``None``.
+        """
+        payload = {"prompt": workflow, "client_id": client_id}
+        result = _post(f"{self.base_url}/prompt", payload, timeout=30.0)
+        if result:
+            return result.get("prompt_id")
+        return None
+
+    def get_queue(self) -> Dict[str, Any]:
+        """Return the current queue status (running + pending jobs)."""
+        return _get(f"{self.base_url}/queue") or {}
+
+    def get_history(self, prompt_id: str) -> Optional[Dict[str, Any]]:
+        """Return the history entry for a completed job."""
+        data = _get(f"{self.base_url}/history/{prompt_id}")
+        if data and prompt_id in data:
+            return data[prompt_id]
+        return None
+
+    def interrupt(self) -> bool:
+        """Interrupt the currently running job."""
+        result = _post(f"{self.base_url}/interrupt", {}, timeout=5.0)
+        return result is not None
+
+    def get_system_stats(self) -> Dict[str, Any]:
+        """Return ComfyUI system stats (GPU memory, python version, etc.)."""
+        return _get(f"{self.base_url}/system_stats") or {}
+
+
+# ---------------------------------------------------------------------------
+# Stable Diffusion WebUI (Automatic1111) client
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SDImage:
+    """A generated image returned by the SD WebUI."""
+    base64_data: str    # Base64-encoded PNG
+    seed: int = -1
+    prompt: str = ""
+    width: int = 512
+    height: int = 512
+
+    def save(self, path: str) -> bool:
+        """Save to disk.  Returns True on success."""
+        import base64  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+        try:
+            Path(path).write_bytes(base64.b64decode(self.base64_data))
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+
+class SDWebUIClient:
+    """Interact with a running Automatic1111 Stable Diffusion WebUI server.
+
+    Parameters
+    ----------
+    base_url:
+        SD WebUI server base URL (default ``http://localhost:7860``).
+    """
+
+    def __init__(self, base_url: str = "http://localhost:7860") -> None:
+        self.base_url = base_url.rstrip("/")
+
+    def is_running(self) -> bool:
+        return _reachable(f"{self.base_url}/sdapi/v1/options")
+
+    def status(self) -> AIAppStatus:
+        running = self.is_running()
+        version = ""
+        if running:
+            data = _get(f"{self.base_url}/sdapi/v1/cmd-flags")
+            if data:
+                version = str(data.get("version", ""))
+        return AIAppStatus(name="Stable Diffusion WebUI", url=self.base_url,
+                           running=running, version=version)
+
+    def txt2img(
+        self,
+        prompt: str,
+        negative_prompt: str = "",
+        width: int = 512,
+        height: int = 512,
+        steps: int = 20,
+        cfg_scale: float = 7.0,
+        seed: int = -1,
+        timeout: float = 180.0,
+    ) -> List[SDImage]:
+        """Generate images from a text prompt.
+
+        Returns a list of :class:`SDImage` objects (usually one unless
+        ``batch_size`` > 1).  Returns an empty list on failure.
+        """
+        payload: Dict[str, Any] = {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "width": width,
+            "height": height,
+            "steps": steps,
+            "cfg_scale": cfg_scale,
+            "seed": seed,
+        }
+        result = _post(f"{self.base_url}/sdapi/v1/txt2img", payload, timeout=timeout)
+        if not result:
+            return []
+        images = result.get("images", [])
+        info_raw = result.get("info", "{}")
+        try:
+            info = json.loads(info_raw) if isinstance(info_raw, str) else info_raw
+        except (json.JSONDecodeError, TypeError):
+            info = {}
+        seeds = info.get("all_seeds", [-1] * len(images))
+        return [
+            SDImage(
+                base64_data=img,
+                seed=seeds[i] if i < len(seeds) else -1,
+                prompt=prompt,
+                width=width,
+                height=height,
+            )
+            for i, img in enumerate(images)
+        ]
+
+    def img2img(
+        self,
+        init_image_b64: str,
+        prompt: str,
+        negative_prompt: str = "",
+        denoising_strength: float = 0.75,
+        width: int = 512,
+        height: int = 512,
+        steps: int = 20,
+        timeout: float = 180.0,
+    ) -> List[SDImage]:
+        """Transform an existing image with a text prompt (img2img).
+
+        Parameters
+        ----------
+        init_image_b64:
+            Base64-encoded source image (PNG or JPEG).
+        """
+        payload: Dict[str, Any] = {
+            "init_images": [init_image_b64],
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "denoising_strength": denoising_strength,
+            "width": width,
+            "height": height,
+            "steps": steps,
+        }
+        result = _post(f"{self.base_url}/sdapi/v1/img2img", payload, timeout=timeout)
+        if not result:
+            return []
+        images = result.get("images", [])
+        return [SDImage(base64_data=img, prompt=prompt, width=width, height=height)
+                for img in images]
+
+    def list_models(self) -> List[str]:
+        """Return model checkpoint names available in the WebUI."""
+        data = _get(f"{self.base_url}/sdapi/v1/sd-models") or []
+        return [m.get("title", "") for m in data]
+
+    def list_samplers(self) -> List[str]:
+        """Return available sampler names."""
+        data = _get(f"{self.base_url}/sdapi/v1/samplers") or []
+        return [s.get("name", "") for s in data]

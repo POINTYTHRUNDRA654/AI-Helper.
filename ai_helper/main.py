@@ -63,12 +63,16 @@ import time
 
 from .agent import Agent
 from .ai_integrations import AIAppRegistry, OllamaClient
+from .backup import BackupManager
 from .communicator import Communicator, Message
 from .gpu_monitor import GpuMonitor
+from .memory import Memory
 from .monitor import SystemMonitor
+from .notification_center import NotificationCenter
 from .orchestrator import Orchestrator
 from .process_manager import ProcessManager
 from .service import ServiceManager
+from .updater import Updater
 from .voice import Speaker, VoiceSettings
 
 
@@ -104,6 +108,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--install-service", action="store_true", help="Install AI Helper as a boot-time auto-start service.")
     parser.add_argument("--uninstall-service", action="store_true", help="Remove the auto-start service.")
     parser.add_argument("--service-status", action="store_true", help="Show current service installation status.")
+    # Dashboard
+    parser.add_argument("--dashboard", action="store_true", help="Launch the live curses terminal dashboard.")
+    # Web UI
+    parser.add_argument("--web-ui", action="store_true", help="Start the browser dashboard web server.")
+    parser.add_argument("--web-port", type=int, default=8765, metavar="PORT", help="Web dashboard port (default: 8765).")
+    # Memory
+    parser.add_argument("--memory", action="store_true", help="Show the AI Helper persistent memory summary.")
+    parser.add_argument("--memory-history", action="store_true", help="Show recent agent conversation history.")
+    # Notification history
+    parser.add_argument("--notify-history", action="store_true", help="Print the notification history and exit.")
+    # Backup
+    parser.add_argument("--backup", metavar="DIR", help="Immediately back up DIR to the D drive.")
+    # Update check
+    parser.add_argument("--check-update", action="store_true", help="Check for a new AI Helper release on GitHub.")
+    # Hotkey info
+    parser.add_argument("--hotkeys", action="store_true", help="Print registered global hotkeys and exit.")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging verbosity (default: INFO).")
     return parser
 
@@ -191,6 +211,83 @@ def main(argv: list[str] | None = None) -> None:  # noqa: UP006
         print(f"Answer:\n{agent_result.answer}")
         if args.voice:
             speaker.speak_now(agent_result.answer)
+        return
+
+    # ------------------------------------------------------------------
+    # Terminal dashboard (blocks until quit)
+    # ------------------------------------------------------------------
+    if args.dashboard:
+        from .dashboard import Dashboard  # noqa: PLC0415
+        print("Starting AI Helper dashboard (press 'q' to quit)…", flush=True)
+        Dashboard(poll_interval=2.0).run()
+        return
+
+    # ------------------------------------------------------------------
+    # Web UI (early exit — blocks in foreground)
+    # ------------------------------------------------------------------
+    if args.web_ui:
+        from .web_ui import WebUI  # noqa: PLC0415
+        ui = WebUI(port=args.web_port)
+        ui.serve_forever()
+        return
+
+    # ------------------------------------------------------------------
+    # Memory summary
+    # ------------------------------------------------------------------
+    if args.memory:
+        mem = Memory()
+        print(mem.summary())
+        return
+
+    if args.memory_history:
+        mem = Memory()
+        convos = mem.recent_conversations(limit=20)
+        if not convos:
+            print("No conversations recorded yet.")
+        for c in convos:
+            print(c)
+        return
+
+    # ------------------------------------------------------------------
+    # Notification history
+    # ------------------------------------------------------------------
+    if args.notify_history:
+        nc = NotificationCenter()
+        print(nc.format_history())
+        return
+
+    # ------------------------------------------------------------------
+    # Backup
+    # ------------------------------------------------------------------
+    if args.backup:
+        from pathlib import Path  # noqa: PLC0415
+        mgr = BackupManager()
+        copied = mgr.backup_now(Path(args.backup))
+        print(f"Backed up {copied} file(s) from {args.backup}")
+        return
+
+    # ------------------------------------------------------------------
+    # Update check
+    # ------------------------------------------------------------------
+    if args.check_update:
+        u = Updater()
+        print("Checking for updates…", flush=True)
+        info = u.check()
+        print(info)
+        if info.update_available:
+            ans = input("Download update? [y/N] ").strip().lower()
+            if ans == "y":
+                dest = u.download(info)
+                if dest:
+                    print(f"Downloaded to {dest}")
+        return
+
+    # ------------------------------------------------------------------
+    # Hotkey info
+    # ------------------------------------------------------------------
+    if args.hotkeys:
+        from .hotkey import HotkeyManager  # noqa: PLC0415
+        print(HotkeyManager().bindings_info())
         return
 
     # ------------------------------------------------------------------

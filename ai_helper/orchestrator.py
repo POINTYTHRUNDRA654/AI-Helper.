@@ -3,7 +3,9 @@
 Wires the :class:`~ai_helper.monitor.SystemMonitor`,
 :class:`~ai_helper.process_manager.ProcessManager`,
 :class:`~ai_helper.gpu_monitor.GpuMonitor`,
-:class:`~ai_helper.ai_integrations.AIAppRegistry` and
+:class:`~ai_helper.ai_integrations.AIAppRegistry`,
+:class:`~ai_helper.notification_center.NotificationCenter`,
+:class:`~ai_helper.memory.Memory` and
 :class:`~ai_helper.communicator.Communicator` together into a single
 polling loop that keeps the desktop *running smooth*, *organised* and
 *communicating*.
@@ -13,13 +15,14 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from typing import Optional
 
 from .ai_integrations import AIAppRegistry
 from .communicator import Communicator
 from .gpu_monitor import GpuMonitor
+from .memory import Memory
 from .monitor import SystemMonitor, SystemSnapshot
+from .notification_center import NotificationCenter
 from .process_manager import ProcessManager
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,10 @@ class Orchestrator:
         Optional pre-configured :class:`~ai_helper.gpu_monitor.GpuMonitor`.
     ai_registry:
         Optional pre-configured :class:`~ai_helper.ai_integrations.AIAppRegistry`.
+    notification_center:
+        Optional pre-configured :class:`~ai_helper.notification_center.NotificationCenter`.
+    memory:
+        Optional pre-configured :class:`~ai_helper.memory.Memory`.
     """
 
     def __init__(
@@ -52,6 +59,8 @@ class Orchestrator:
         communicator: Optional[Communicator] = None,
         gpu_monitor: Optional[GpuMonitor] = None,
         ai_registry: Optional[AIAppRegistry] = None,
+        notification_center: Optional[NotificationCenter] = None,
+        memory: Optional[Memory] = None,
     ) -> None:
         self.poll_interval = poll_interval
         self.monitor = monitor or SystemMonitor()
@@ -59,6 +68,8 @@ class Orchestrator:
         self.communicator = communicator or Communicator()
         self.gpu_monitor = gpu_monitor or GpuMonitor()
         self.ai_registry = ai_registry or AIAppRegistry()
+        self.notification_center = notification_center or NotificationCenter()
+        self.memory = memory or Memory()
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -114,6 +125,16 @@ class Orchestrator:
                 logger.exception("Unexpected error in orchestrator tick")
             self._stop_event.wait(timeout=self.poll_interval)
 
+    def _alert(self, message: str, source: str, urgency: str = "normal",
+               topic: str = "alert", metric: str = "", value: float = 0.0) -> None:
+        """Fire an alert through the notification center, communicator and memory."""
+        rec = self.notification_center.notify(message, source=source,
+                                              urgency=urgency, topic=topic)
+        if not rec.suppressed:
+            self.communicator.alert(message, source=source, urgency=urgency, topic=topic)
+            if metric:
+                self.memory.record_anomaly(metric, value=value, z_score=0.0, details=message)
+
     def _check_system(self) -> None:
         snap: SystemSnapshot = self.monitor.snapshot()
         self.communicator.publish("snapshot", snap, source="monitor")
@@ -121,7 +142,9 @@ class Orchestrator:
 
         for alert_msg in self.monitor.alerts(snap):
             logger.warning("SYSTEM ALERT: %s", alert_msg)
-            self.communicator.alert(alert_msg, source="monitor", urgency="critical")
+            self._alert(alert_msg, source="monitor", urgency="critical",
+                        topic="alert", metric="system",
+                        value=snap.cpu_percent)
 
     def _check_processes(self) -> None:
         procs = self.process_manager.list_processes()
@@ -131,15 +154,15 @@ class Orchestrator:
         for proc in self.process_manager.high_cpu_processes(procs):
             msg = f"Process {proc.name!r} (PID {proc.pid}) using {proc.cpu_percent:.1f}% CPU"
             logger.warning("PROCESS ALERT: %s", msg)
-            self.communicator.alert(msg, source="process_manager", urgency="normal", topic="process_alert")
+            self._alert(msg, source="process_manager", urgency="normal",
+                        topic="process_alert", metric="cpu", value=proc.cpu_percent)
 
         for proc in self.process_manager.high_memory_processes(procs):
-            msg = (
-                f"Process {proc.name!r} (PID {proc.pid}) "
-                f"using {proc.memory_mb:.0f} MB memory"
-            )
+            msg = (f"Process {proc.name!r} (PID {proc.pid}) "
+                   f"using {proc.memory_mb:.0f} MB memory")
             logger.warning("PROCESS ALERT: %s", msg)
-            self.communicator.alert(msg, source="process_manager", urgency="normal", topic="process_alert")
+            self._alert(msg, source="process_manager", urgency="normal",
+                        topic="process_alert", metric="memory", value=proc.memory_mb)
 
     def _check_gpu(self) -> None:
         if not self.gpu_monitor.available:
@@ -150,7 +173,8 @@ class Orchestrator:
             logger.debug("%s", self.gpu_monitor.format_snapshots(snaps))
         for alert_msg in self.gpu_monitor.alerts(snaps):
             logger.warning("GPU ALERT: %s", alert_msg)
-            self.communicator.alert(alert_msg, source="gpu_monitor", urgency="critical", topic="gpu_alert")
+            self._alert(alert_msg, source="gpu_monitor", urgency="critical",
+                        topic="gpu_alert", metric="gpu")
 
     def _check_ai_apps(self) -> None:
         running_apps = self.ai_registry.running()
