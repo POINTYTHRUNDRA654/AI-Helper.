@@ -61,6 +61,7 @@ import signal
 import sys
 import time
 
+from .agent import Agent
 from .ai_integrations import AIAppRegistry, OllamaClient
 from .communicator import Communicator, Message
 from .gpu_monitor import GpuMonitor
@@ -93,6 +94,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ollama-ask", metavar="TEXT", help="Send a prompt to Ollama and print the reply.")
     parser.add_argument("--ollama-model", default="llama3", metavar="MODEL", help="Ollama model for --ollama-ask (default: llama3).")
     parser.add_argument("--ollama-url", default="http://localhost:11434", metavar="URL", help="Ollama base URL.")
+    # Agent / tool use
+    parser.add_argument("--ask", metavar="GOAL",
+                        help="Give AI Helper a goal in plain English and let the agent "
+                             "plan and execute it using all available tools.")
+    parser.add_argument("--steps", type=int, default=10, metavar="N",
+                        help="Maximum agent steps for --ask (default: 10).")
     # Service options
     parser.add_argument("--install-service", action="store_true", help="Install AI Helper as a boot-time auto-start service.")
     parser.add_argument("--uninstall-service", action="store_true", help="Remove the auto-start service.")
@@ -163,6 +170,27 @@ def main(argv: list[str] | None = None) -> None:  # noqa: UP006
     if args.list_ai:
         registry = AIAppRegistry()
         print(registry.format_status())
+        return
+
+    # ------------------------------------------------------------------
+    # Agent / tool-use (early exit)
+    # ------------------------------------------------------------------
+    if args.ask:
+        agent = Agent(
+            ollama_model=args.ollama_model,
+            ollama_url=args.ollama_url,
+            max_steps=args.steps,
+        )
+        print(f"AI Helper is working on: {args.ask!r}\n", flush=True)
+        agent_result = agent.execute(args.ask)
+        # Print each step
+        for step in agent_result.steps:
+            print(step)
+            print()
+        print("─" * 60)
+        print(f"Answer:\n{agent_result.answer}")
+        if args.voice:
+            speaker.speak_now(agent_result.answer)
         return
 
     # ------------------------------------------------------------------
