@@ -358,7 +358,7 @@ class _Handler(BaseHTTPRequestHandler):
             body = json.dumps({
                 "ok": True,
                 "answer": getattr(result, "answer", ""),
-                "steps": getattr(result, "steps", []),
+                "steps": [str(s) for s in getattr(result, "steps", [])],
             }).encode()
             self._respond(200, "application/json", body)
         except Exception as exc:  # noqa: BLE001

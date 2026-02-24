@@ -111,7 +111,8 @@ class HUDApp:
                 agent = Agent()
                 res = agent.execute(prompt)
                 answer = getattr(res, "answer", "")
-                steps = getattr(res, "steps", [])
+                steps_raw = getattr(res, "steps", [])
+                steps = [str(s) for s in steps_raw] if steps_raw else []
                 text = "\n\n".join(steps + ([answer] if answer else [])) or "(no answer)"
             except Exception as exc:  # noqa: BLE001
                 text = f"Error: {exc}"
