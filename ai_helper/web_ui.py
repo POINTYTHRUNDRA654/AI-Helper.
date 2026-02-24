@@ -195,6 +195,15 @@ def _render_html(data: Dict[str, Any], port: int, refresh: int) -> str:
     li {{ margin:4px 0; }}
     a {{ color:var(--accent); }}
     footer {{ margin-top:24px; color:var(--muted); font-size:0.8em; text-align:center; }}
+        .chat {{ display:flex; flex-direction:column; gap:8px; }}
+        .chat textarea {{ width:100%; min-height:120px; background:#111; color:#e0e0e0;
+                                            border:1px solid var(--border); border-radius:6px; padding:8px; }}
+        .chat button {{ align-self:flex-start; background:var(--accent); color:#000; border:none;
+                                        padding:8px 14px; border-radius:4px; cursor:pointer; font-weight:bold; }}
+        .chat button:disabled {{ opacity:0.5; cursor:wait; }}
+        .chat .result {{ white-space:pre-wrap; background:#0d0d0d; border:1px solid var(--border);
+                                         border-radius:6px; padding:8px; min-height:60px; }}
+        .muted {{ color:var(--muted); }}
   </style>
 </head>
 <body>
@@ -244,8 +253,52 @@ def _render_html(data: Dict[str, Any], port: int, refresh: int) -> str:
       <ul>{alert_items}</ul>
     </div>
 
+        <div class="card">
+            <h2>Ask AI Helper</h2>
+            <div class="chat">
+                <label for="prompt" class="muted">Type a request and click Ask. Runs with the built-in agent (no voice required).</label>
+                <textarea id="prompt" placeholder="E.g. summarize current system status"></textarea>
+                <div style="display:flex; gap:8px; align-items:center;">
+                    <button id="ask-btn" onclick="ask()">Ask</button>
+                    <span id="ask-status" class="muted"></span>
+                </div>
+                <div id="ask-result" class="result" aria-live="polite">Waiting for a question…</div>
+            </div>
+        </div>
+
   </div>
   <footer>AI Helper — serving on port {port} — {platform.node()}</footer>
+    <script>
+        async function ask() {{
+            const btn = document.getElementById('ask-btn');
+            const status = document.getElementById('ask-status');
+            const result = document.getElementById('ask-result');
+            const prompt = document.getElementById('prompt').value.trim();
+            if (!prompt) {{ result.textContent = 'Please enter a prompt first.'; return; }}
+            btn.disabled = true;
+            status.textContent = 'Working…';
+            result.textContent = '';
+            try {{
+                const resp = await fetch('/api/ask', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ prompt }})
+                }});
+                const data = await resp.json();
+                if (!data.ok) {{
+                    result.textContent = 'Error: ' + (data.error || 'Unknown error');
+                }} else {{
+                    const steps = (data.steps || []).join('\n\n');
+                    result.textContent = (steps ? steps + '\n\n' : '') + (data.answer || '');
+                }}
+            }} catch (e) {{
+                result.textContent = 'Request failed: ' + e;
+            }} finally {{
+                btn.disabled = false;
+                status.textContent = '';
+            }}
+        }}
+    </script>
 </body>
 </html>"""
 
@@ -278,6 +331,39 @@ class _Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args: Any) -> None:  # noqa: ANN002
         logger.debug("WebUI: %s", args[1] if len(args) > 1 else args)
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != "/api/ask":
+            self._respond(404, "application/json", b"{}")
+            return
+
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw or b"{}")
+            prompt = (payload.get("prompt") or "").strip()
+        except Exception:  # noqa: BLE001
+            self._respond(400, "application/json", b'{"ok":false,"error":"Invalid JSON"}')
+            return
+
+        if not prompt:
+            self._respond(400, "application/json", b'{"ok":false,"error":"Prompt is required"}')
+            return
+
+        try:
+            from .agent import Agent  # noqa: PLC0415
+
+            agent = Agent()
+            result = agent.execute(prompt)
+            body = json.dumps({
+                "ok": True,
+                "answer": getattr(result, "answer", ""),
+                "steps": getattr(result, "steps", []),
+            }).encode()
+            self._respond(200, "application/json", body)
+        except Exception as exc:  # noqa: BLE001
+            err = json.dumps({"ok": False, "error": str(exc)}).encode()
+            self._respond(500, "application/json", err)
 
 
 class WebUI:

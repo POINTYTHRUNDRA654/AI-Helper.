@@ -74,6 +74,7 @@ from .process_manager import ProcessManager
 from .service import ServiceManager
 from .updater import Updater
 from .voice import Speaker, VoiceSettings
+from .wake_word import WakeWordListener
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -110,9 +111,41 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--service-status", action="store_true", help="Show current service installation status.")
     # Dashboard
     parser.add_argument("--dashboard", action="store_true", help="Launch the live curses terminal dashboard.")
+    parser.add_argument("--hud", action="store_true", help="Open the desktop HUD window (no voice, local only).")
     # Web UI
     parser.add_argument("--web-ui", action="store_true", help="Start the browser dashboard web server.")
     parser.add_argument("--web-port", type=int, default=8765, metavar="PORT", help="Web dashboard port (default: 8765).")
+    # Wake word / voice activation (prototype)
+    parser.add_argument("--wake-word", metavar="WORD", help="Enable wake-word listener (requires microphone + SpeechRecognition).")
+    parser.add_argument(
+        "--wake-phrase-seconds",
+        type=float,
+        default=6.0,
+        metavar="SECONDS",
+        help="Max seconds to capture a spoken command after the wake word (default: 6).",
+    )
+    parser.add_argument(
+        "--wake-mic-index",
+        type=int,
+        metavar="IDX",
+        help="Microphone device index for wake word (use --list-mics to see devices).",
+    )
+    parser.add_argument(
+        "--list-mics",
+        action="store_true",
+        help="List microphone devices and exit (requires SpeechRecognition).",
+    )
+    parser.add_argument(
+        "--wake-stt",
+        choices=["google", "whisper"],
+        default="google",
+        help="Speech-to-text backend for wake word commands (default: google).",
+    )
+    parser.add_argument(
+        "--wake-whisper-model",
+        default="small.en",
+        help="Whisper model size/path when using --wake-stt whisper (default: small.en).",
+    )
     # Memory
     parser.add_argument("--memory", action="store_true", help="Show the AI Helper persistent memory summary.")
     parser.add_argument("--memory-history", action="store_true", help="Show recent agent conversation history.")
@@ -149,6 +182,24 @@ def main(argv: list[str] | None = None) -> None:  # noqa: UP006
         from .diagnostics import run_diagnostics  # noqa: PLC0415
         _, passed = run_diagnostics(verbose=True)
         sys.exit(0 if passed else 1)
+
+    # ------------------------------------------------------------------
+    # Microphone listing (early exit)
+    # ------------------------------------------------------------------
+    if args.list_mics:
+        try:
+            import speech_recognition as sr  # type: ignore
+
+            names = sr.Microphone.list_microphone_names() or []
+            if not names:
+                print("No microphones found.")
+            else:
+                print("Available microphones:")
+                for i, name in enumerate(names):
+                    print(f"  [{i}] {name}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not list microphones: {exc}")
+        return
 
     # ------------------------------------------------------------------
     # Voice / TTS setup
@@ -232,6 +283,16 @@ def main(argv: list[str] | None = None) -> None:  # noqa: UP006
         from .dashboard import Dashboard  # noqa: PLC0415
         print("Starting AI Helper dashboard (press 'q' to quit)…", flush=True)
         Dashboard(poll_interval=2.0).run()
+        return
+
+    # ------------------------------------------------------------------
+    # Desktop HUD (blocks until closed)
+    # ------------------------------------------------------------------
+    if args.hud:
+        from .hud import run_hud  # noqa: PLC0415
+
+        print("Starting AI Helper HUD…", flush=True)
+        run_hud()
         return
 
     # ------------------------------------------------------------------
@@ -365,6 +426,37 @@ def main(argv: list[str] | None = None) -> None:  # noqa: UP006
         communicator=communicator,
     )
 
+    # Optional wake-word listener (prototype)
+    wake_listener = None
+    if args.wake_word:
+        try:
+            wake_listener = WakeWordListener(
+                wake_word=args.wake_word,
+                phrase_time_limit=args.wake_phrase_seconds,
+                device_index=args.wake_mic_index,
+                backend=args.wake_stt,
+                whisper_model=args.wake_whisper_model,
+            )
+            if wake_listener.available:
+                agent_for_wake = Agent(max_steps=args.steps, ollama_url=args.ollama_url, ollama_model=args.ollama_model)
+
+                def _on_wake_command(text: str) -> None:
+                    print(f"[wake] Heard command: {text}", flush=True)
+                    try:
+                        result = agent_for_wake.execute(text)
+                        print(result.answer, flush=True)
+                        if args.voice:
+                            speaker.speak(result.answer)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"Wake-word command error: {exc}", flush=True)
+
+                wake_listener.start(_on_wake_command)
+            else:
+                print("Wake-word listener unavailable (install SpeechRecognition + PyAudio).", flush=True)
+                wake_listener = None
+        except Exception as exc:  # noqa: BLE001
+            print(f"Wake-word listener failed to start: {exc}", flush=True)
+
     if args.voice:
         speaker.speak_now("AI Helper started.")
 
@@ -373,6 +465,8 @@ def main(argv: list[str] | None = None) -> None:  # noqa: UP006
         if args.voice:
             speaker.speak_now("AI Helper shutting down.")
         orchestrator.stop()
+        if wake_listener:
+            wake_listener.stop()
         speaker.shutdown()
         sys.exit(0)
 

@@ -233,11 +233,18 @@ class Speaker:
                     check=False, timeout=60,
                 )
             elif _SYSTEM == "Windows":
+                # Prefer a female voice on Windows by default; allow explicit overrides via settings.voice_id.
+                voice_cmd = (
+                    f'$s.SelectVoice("{self.settings.voice_id}"); '
+                    if self.settings.voice_id
+                    else "$s.SelectVoiceByHints([System.Speech.Synthesis.VoiceGender]::Female); "
+                )
                 ps_script = (
                     "Add-Type -AssemblyName System.speech; "
                     "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
                     f"$s.Rate = {self._ps_rate()}; "
                     f"$s.Volume = {int(self.settings.volume * 100)}; "
+                    f"{voice_cmd}"
                     f'$s.Speak("{safe}");'
                 )
                 subprocess.run(
