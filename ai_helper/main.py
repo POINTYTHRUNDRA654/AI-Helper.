@@ -122,6 +122,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backup", metavar="DIR", help="Immediately back up DIR to the D drive.")
     # Update check
     parser.add_argument("--check-update", action="store_true", help="Check for a new AI Helper release on GitHub.")
+    # Diagnostics
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="Run installation diagnostics: verify required packages, "
+                             "core modules and basic functionality, then exit.")
     # Hotkey info
     parser.add_argument("--hotkeys", action="store_true", help="Print registered global hotkeys and exit.")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging verbosity (default: INFO).")
@@ -137,6 +141,14 @@ def main(argv: list[str] | None = None) -> None:  # noqa: UP006
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    # ------------------------------------------------------------------
+    # Diagnostics (early exit)
+    # ------------------------------------------------------------------
+    if args.diagnostics:
+        from .diagnostics import run_diagnostics  # noqa: PLC0415
+        _, passed = run_diagnostics(verbose=True)
+        sys.exit(0 if passed else 1)
 
     # ------------------------------------------------------------------
     # Voice / TTS setup

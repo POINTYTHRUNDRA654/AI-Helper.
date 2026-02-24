@@ -45,14 +45,20 @@ autonomously use any file or program on your computer to help you get things don
 # 1 – Clone to D drive (Windows) or home dir (Linux/macOS)
 git clone https://github.com/POINTYTHRUNDRA654/AI-Helper. D:\AI-Helper\src
 
-# 2 – Install Python packages (also routed to D drive via pip.ini)
+# 2a – Install as a package (recommended)
 cd D:\AI-Helper\src
+pip install .
+
+# 2b – Or install dependencies only
 pip install -r requirements.txt
 
 # Optional – for GPU monitoring
 pip install pynvml
 
-# 3 – One-shot system status check
+# 3 – Verify the installation with diagnostics
+python -m ai_helper --diagnostics
+
+# 4 – One-shot system status check
 python -m ai_helper
 ```
 
@@ -61,6 +67,14 @@ python -m ai_helper
 ---
 
 ## CLI Reference
+
+### Diagnostics
+
+```bash
+# Verify all required packages are installed and every module is working.
+# Exits with code 0 if everything passes, 1 if any check fails.
+python -m ai_helper --diagnostics
+```
 
 ### Basic usage
 
