@@ -19,6 +19,7 @@ autonomously use any file or program on your computer to help you get things don
 | 🎨 **ComfyUI** | Queue workflows, check status, interrupt jobs |
 | 🖼️ **Stable Diffusion** | txt2img, img2img, list models/samplers |
 | 💬 **LM Studio** | Chat completions, list loaded models |
+| 🧬 **Gemma Fine-Tuning** | Fine-tune & run Gemma 4 models locally with Unsloth (1.5x faster, 60% less VRAM) |
 | 🎮 **NVIDIA GPU** | VRAM, temperature, utilisation, per-process memory |
 | 📁 **File system** | Search, read, write, watch any file on disk |
 | 💾 **Auto-backup** | Watch folders; version every change to D:\\AI-Helper\\Backups |

@@ -3,9 +3,24 @@ from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import copy_metadata
 
 datas = []
-hiddenimports = ['ai_helper.organizer', 'ai_helper.clipboard_monitor', 'pynput']
+hiddenimports = ['ai_helper.organizer', 'ai_helper.clipboard_monitor', 'ai_helper.gemma_finetuner', 'pynput']
 datas += copy_metadata('pynput')
-hiddenimports += collect_submodules('pynput')
+if collect_submodules('pynput'):
+    hiddenimports += collect_submodules('pynput')
+# Add metadata and submodules for ML/transformers libraries if available
+try:
+    datas += copy_metadata('transformers')
+    hiddenimports += collect_submodules('transformers')
+except Exception:
+    pass
+try:
+    datas += copy_metadata('torch')
+except Exception:
+    pass
+try:
+    hiddenimports += collect_submodules('bitsandbytes')
+except Exception:
+    pass
 
 
 a = Analysis(

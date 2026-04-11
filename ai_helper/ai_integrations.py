@@ -21,6 +21,13 @@ Supported programs
 | **LLaMA.cpp server**   | http://localhost:8000         | Raw GGUF serving |
 +------------------------+-------------------------------+------------------+
 
+Local Fine-Tuning
+-----------------
+For local model training and fine-tuning, see ``gemma_finetuner`` module:
+  - Gemma 2 2B, 9B, 27B models
+  - Unsloth-powered fine-tuning (1.5x faster, 60% less VRAM)
+  - 4-bit quantization support for 8GB VRAM systems
+
 All HTTP calls use the standard-library ``urllib`` — no extra packages
 needed.  Each integration gracefully returns ``running=False`` if the
 server is not reachable.

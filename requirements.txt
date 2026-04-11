@@ -2,3 +2,13 @@ psutil>=5.9.0
 pyttsx3>=2.90
 pynput>=1.8.1
 pyperclip>=1.11.0
+
+# Gemma 4 fine-tuning with Unsloth
+torch>=2.0.0
+transformers>=4.36.0
+unsloth[colab-new]>=2024.1
+datasets>=2.14.0
+trl>=0.7.0
+bitsandbytes>=0.41.0
+peft>=0.7.0
+accelerate>=0.25.0
