@@ -37,7 +37,7 @@ from __future__ import annotations
 import curses
 import logging
 import time
-from typing import List, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 

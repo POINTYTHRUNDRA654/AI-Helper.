@@ -1,4 +1,4 @@
-"""Tests for Gemma fine-tuning engine."""
+"""Tests for the fine-tuning engine (GemmaFineTuner, UnslothFineTuner, helpers)."""
 
 import unittest
 from unittest.mock import MagicMock, patch
@@ -12,6 +12,9 @@ from ai_helper.gemma_finetuner import (
     GPUMemoryProfiler,
     InferenceResult,
     TrainingResult,
+    UnslothFineTuner,
+    list_recommended_models,
+    prepare_mossy_dataset,
 )
 
 
@@ -175,21 +178,167 @@ class TestInferenceResult(unittest.TestCase):
 
 class TestModelConfiguration(unittest.TestCase):
     """Test model configuration constants."""
-    
+
     def test_gemma_models_defined(self):
-        """Test that Gemma models are properly defined."""
+        """GEMMA_MODELS contains entries with required keys."""
         self.assertGreater(len(GEMMA_MODELS), 0)
         for model_name, config in GEMMA_MODELS.items():
-            self.assertIn("model_id", config)
-            self.assertIn("vram_gb", config)
-            self.assertIn("description", config)
-    
+            self.assertIn("model_id", config, model_name)
+            self.assertIn("vram_gb", config, model_name)
+            self.assertIn("description", config, model_name)
+
     def test_all_models_have_reasonable_vram(self):
-        """Test that all models have reasonable VRAM requirements."""
+        """All models report a sane VRAM requirement."""
         for model_name, config in GEMMA_MODELS.items():
             vram = config["vram_gb"]
-            self.assertGreater(vram, 0)
-            self.assertLess(vram, 100)  # Sanity check
+            self.assertGreater(vram, 0, model_name)
+            self.assertLess(vram, 100, model_name)
+
+    def test_new_model_families_present(self):
+        """Gemma 4, Phi-4, LLaMA-3, Mistral, and Qwen models are all registered."""
+        keys = set(GEMMA_MODELS.keys())
+        self.assertTrue(any("gemma-4" in k for k in keys), "No Gemma 4 entries")
+        self.assertTrue(any("phi" in k for k in keys), "No Phi entries")
+        self.assertTrue(any("llama" in k.lower() for k in keys), "No LLaMA entries")
+        self.assertTrue(any("mistral" in k.lower() for k in keys), "No Mistral entries")
+        self.assertTrue(any("qwen" in k.lower() for k in keys), "No Qwen entries")
+
+    def test_unsloth_ids_are_strings(self):
+        """Models with an unsloth_id store it as a non-empty string."""
+        for model_name, config in GEMMA_MODELS.items():
+            if "unsloth_id" in config:
+                self.assertIsInstance(config["unsloth_id"], str, model_name)
+                self.assertGreater(len(config["unsloth_id"]), 0, model_name)
+
+
+class TestUnslothFineTuner(unittest.TestCase):
+    """Tests for UnslothFineTuner initialisation and metadata."""
+
+    def test_init_valid_model(self):
+        """UnslothFineTuner initialises cleanly for any registered model."""
+        tuner = UnslothFineTuner(model_name="gemma-4-9b")
+        self.assertEqual(tuner.model_name, "gemma-4-9b")
+        self.assertFalse(tuner._loaded)
+
+    def test_init_invalid_model(self):
+        """Unknown model name raises ValueError."""
+        with self.assertRaises(ValueError):
+            UnslothFineTuner(model_name="nonexistent-model-xyz")
+
+    def test_init_defaults(self):
+        """Default constructor uses gemma-4-9b with 4-bit quantisation."""
+        tuner = UnslothFineTuner()
+        self.assertEqual(tuner.model_name, "gemma-4-9b")
+        self.assertTrue(tuner.load_in_4bit)
+        self.assertEqual(tuner.max_seq_length, 2048)
+
+    def test_get_model_info_not_loaded(self):
+        """get_model_info works before the model is loaded."""
+        tuner = UnslothFineTuner(model_name="phi-4-mini")
+        info = tuner.get_model_info()
+        self.assertEqual(info["name"], "phi-4-mini")
+        self.assertFalse(info["loaded"])
+        self.assertIn("unsloth_id", info)
+
+    def test_all_registered_models_instantiate(self):
+        """Every key in GEMMA_MODELS can be used to construct UnslothFineTuner."""
+        for key in GEMMA_MODELS:
+            tuner = UnslothFineTuner(model_name=key)
+            self.assertEqual(tuner.model_name, key)
+
+    def test_save_gguf_without_loaded_model(self):
+        """save_gguf returns False when model is not loaded."""
+        tuner = UnslothFineTuner(model_name="gemma-4-9b")
+        result = tuner.save_gguf("/tmp/test_gguf")
+        self.assertFalse(result)
+
+
+class TestPrepareMossyDataset(unittest.TestCase):
+    """Tests for prepare_mossy_dataset helper."""
+
+    def _pairs(self):
+        return [
+            ("What is the weapon poly budget?",
+             "A standard weapon should stay under 5,000 triangles."),
+            ("What NIF block is used for static props?",
+             "BSTriShape is the geometry block; BSFadeNode is the root."),
+        ]
+
+    def test_chatml_format(self):
+        """chatml format produces <|im_start|> tagged text."""
+        ds = prepare_mossy_dataset(self._pairs(), format="chatml")
+        self.assertEqual(len(ds), 2)
+        text = ds[0]["text"]
+        self.assertIn("<|im_start|>system", text)
+        self.assertIn("<|im_start|>user", text)
+        self.assertIn("<|im_start|>assistant", text)
+        self.assertIn("weapon poly budget", text)
+
+    def test_llama3_format(self):
+        """llama3 format produces <|begin_of_text|> tagged text."""
+        ds = prepare_mossy_dataset(self._pairs(), format="llama3")
+        self.assertEqual(len(ds), 2)
+        text = ds[0]["text"]
+        self.assertIn("<|begin_of_text|>", text)
+        self.assertIn("<|start_header_id|>user<|end_header_id|>", text)
+
+    def test_gemma_format(self):
+        """gemma format produces <start_of_turn> tagged text."""
+        ds = prepare_mossy_dataset(self._pairs(), format="gemma")
+        self.assertEqual(len(ds), 2)
+        text = ds[0]["text"]
+        self.assertIn("<start_of_turn>user", text)
+        self.assertIn("<start_of_turn>model", text)
+
+    def test_invalid_format_raises(self):
+        """Unknown format raises ValueError."""
+        with self.assertRaises(ValueError):
+            prepare_mossy_dataset(self._pairs(), format="unknown_format")
+
+    def test_custom_system_prompt(self):
+        """Custom system prompt is embedded in the output."""
+        custom = "You are a master blacksmith."
+        ds = prepare_mossy_dataset(self._pairs(), system_prompt=custom, format="chatml")
+        self.assertIn(custom, ds[0]["text"])
+
+    def test_dataset_has_text_column(self):
+        """Output dataset always has a 'text' column."""
+        ds = prepare_mossy_dataset(self._pairs())
+        self.assertIn("text", ds.column_names)
+
+    def test_empty_dataset(self):
+        """Empty input produces an empty dataset."""
+        ds = prepare_mossy_dataset([])
+        self.assertEqual(len(ds), 0)
+
+
+class TestListRecommendedModels(unittest.TestCase):
+    """Tests for list_recommended_models helper."""
+
+    def test_returns_string(self):
+        """list_recommended_models returns a non-empty string."""
+        result = list_recommended_models()
+        self.assertIsInstance(result, str)
+        self.assertGreater(len(result), 100)
+
+    def test_contains_model_keys(self):
+        """Output mentions known model keys."""
+        result = list_recommended_models()
+        self.assertIn("gemma-4-9b", result)
+        self.assertIn("phi-4", result)
+
+    def test_vram_filter(self):
+        """With a 4 GB VRAM filter only small models appear."""
+        result = list_recommended_models(available_vram_gb=4.0)
+        # gemma-4-27b needs 20 GB — must not appear
+        self.assertNotIn("gemma-4-27b", result)
+        # gemma-2-2b needs 2 GB — must appear
+        self.assertIn("gemma-2-2b", result)
+
+    def test_unsloth_marker_present(self):
+        """Output includes the Unsloth marker for supported models."""
+        result = list_recommended_models()
+        self.assertIn("Unsloth", result)
 
 
 if __name__ == "__main__":

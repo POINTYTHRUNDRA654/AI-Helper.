@@ -100,9 +100,9 @@ class AgentResult:
 # System prompt for Ollama planning
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT_TEMPLATE = """\
-You are AI Helper, an intelligent desktop assistant with access to the \
-user's computer files, programs and system information.
+_SYSTEM_PROMPT_BASE = """\
+You are Mossy, an intelligent AI desktop assistant with full access to \
+the user's computer files, programs and system information.
 
 {tool_catalogue}
 
@@ -116,6 +116,26 @@ Rules:
   {{"thought": "<summary>", "tool": "finish", "args": {{"answer": "<final answer to user>"}}}}
 - If a tool fails, try a different approach.
 - Keep thoughts concise (one sentence).
+"""
+
+_SYSTEM_PROMPT_MESH_ADDON = """\
+
+You also have deep expertise in Fallout 4 modding and 3D mesh creation:
+- NIF format (BSTriShape, BSFadeNode, BSLightingShaderProperty, BSXFlags,
+  bhkCollisionObject, NIF version 20.2.0.7 / uv=12 / uv2=130)
+- Shader flags (SLSF1/SLSF2 — specular, skinned, double-sided, glow, vertex colours)
+- Texture pipeline: BC1/BC3/BC5 DDS, _d/_n/_s/_g/_e channels, Texconv CLI commands
+- Free image-to-3D: TripoSG (8GB), TRELLIS (16GB), TripoSR (6GB),
+  InstantMesh (12GB), Shap-E (CPU) — all MIT/Apache from GitHub/HF
+- Meshy API (user has paid subscription) — best quality AI image-to-3D
+- Blender + NifTools: import/export NIF, UV naming, collision, LOD export
+- Photogrammetry: Meshroom (free), COLMAP, photo capture best practices
+- Polygon budgets: weapon 5K, armor 3-8K, settlement 1-6K, character 4-6K
+- LOD, collision shapes, scale (70 units/metre), coordinate system
+- Weapon mods (AP_ nodes), workshop snap points (P-SNP-), BGSM/BGEM materials
+- Animation/rigging: skeleton NIF, skin bindings, HKX, Outfit Studio
+- NifSkope tips and common FO4 error fixes
+For Fallout 4 modding questions you can answer directly from knowledge without a tool.
 """
 
 
@@ -138,6 +158,14 @@ class Agent:
         Ollama server URL (default ``"http://localhost:11434"``).
     max_steps:
         Maximum tool-call iterations before giving up (default ``10``).
+    max_context_messages:
+        Maximum number of messages to keep in the LLM context window.
+        Older messages are pruned (keeping the system prompt and the most
+        recent exchanges) to avoid exceeding the model's context limit.
+        Default: 40 messages.
+    llm_retry_attempts:
+        Number of times to retry a failed LLM call before giving up.
+        Default: 2.
     """
 
     _FINISH = "finish"
@@ -148,11 +176,15 @@ class Agent:
         ollama_model: str = "llama3",
         ollama_url: str = "http://localhost:11434",
         max_steps: int = 10,
+        max_context_messages: int = 40,
+        llm_retry_attempts: int = 2,
     ) -> None:
         self.registry = registry or ToolRegistry()
         self.ollama_model = ollama_model
         self.ollama_url = ollama_url
         self.max_steps = max_steps
+        self.max_context_messages = max_context_messages
+        self.llm_retry_attempts = llm_retry_attempts
 
     # ------------------------------------------------------------------
     # Public API
@@ -192,7 +224,12 @@ class Agent:
         from .ai_integrations import OllamaClient  # noqa: PLC0415
         client = OllamaClient(base_url=self.ollama_url)
 
-        system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+        tool_names = {t.name for t in self.registry.list_tools()}
+        has_mesh_tools = bool(tool_names & {"mesh_ask", "mesh_free_image_to_3d", "mesh_validate"})
+        prompt_template = _SYSTEM_PROMPT_BASE
+        if has_mesh_tools:
+            prompt_template += _SYSTEM_PROMPT_MESH_ADDON
+        system_prompt = prompt_template.format(
             tool_catalogue=self.registry.describe_all()
         )
         messages: List[Dict[str, str]] = [
@@ -202,7 +239,21 @@ class Agent:
 
         for step_num in range(1, self.max_steps + 1):
             t_step = time.monotonic()
-            llm_result = client.chat(self.ollama_model, messages, timeout=60.0)
+
+            # Retry the LLM call on transient errors.
+            # llm_retry_attempts=2 means: 1 initial call + 2 retries = 3 total attempts.
+            llm_result = None
+            total_attempts = self.llm_retry_attempts + 1
+            for attempt in range(1, total_attempts + 1):
+                llm_result = client.chat(self.ollama_model, messages, timeout=60.0)
+                if not llm_result.error:
+                    break
+                if attempt < total_attempts:
+                    logger.warning(
+                        "LLM call failed (attempt %d/%d): %s — retrying…",
+                        attempt, total_attempts, llm_result.error,
+                    )
+                    time.sleep(1.0 * attempt)
 
             if llm_result.error:
                 result.answer = f"Ollama error: {llm_result.error}"
@@ -241,6 +292,9 @@ class Agent:
             observation = tool_result.output if tool_result.success else f"Error: {tool_result.error}"
             messages.append({"role": "user", "content": f"Tool result:\n{observation}"})
 
+            # Prune context window: keep system prompt + most recent messages
+            self._prune_messages(messages)
+
         if not result.answer:
             result.answer = (
                 result.steps[-1].result.output if result.steps else
@@ -273,6 +327,51 @@ class Agent:
          "list_ollama_models", {}),
         (r"\bollama\b|local\s+llm|local\s+model|ask.*model",
          "ask_ollama", {}),
+        # mesh / 3d patterns — specific ones first
+        (r"\bmesh.*depend|depend.*mesh|install.*mesh|mesh.*install|check.*mesh",
+         "mesh_check_deps", {}),
+        (r"\bfree.*3d\s+tool|list.*3d\s+tool|3d\s+tool.*free|triposg|triposr|trellis|shap.e|instantmesh",
+         "mesh_list_free_tools", {}),
+        (r"\binstall.*triposg|install.*trellis|install.*triposr|install.*shap.e|how.*install.*3d",
+         "mesh_install_instructions", {}),
+        (r"\b(triposg|trellis|triposr|shap.e|free\s+3d|free.*mesh).*convert|convert.*image.*3d.*free",
+         "mesh_free_image_to_3d", {}),
+        (r"\bmeshy\b.*convert|convert.*meshy|meshy.*image|image.*meshy",
+         "mesh_meshy_image_to_3d", {}),
+        (r"\bconvert.*image.*3d|image.*to.*3d|scan.*image.*mesh|photo.*to.*mesh|image.*mesh",
+         "mesh_free_image_to_3d", {}),
+        (r"\bvalidate.*mesh|check.*mesh.*fallout|mesh.*valid|polygon.*budget",
+         "mesh_validate", {}),
+        (r"\bworkflow.*mesh|mesh.*workflow|how.*make.*nif|image.*fallout.*4|fallout.*mesh",
+         "mesh_workflow", {}),
+        (r"\bnif\b|bstriShape|bsfadenode|collision.*mesh|mesh.*nif|fallout.*4.*mesh"
+         r"|polygon.*fallout|texture.*fallout|lod.*fallout",
+         "mesh_ask", {}),
+        # web
+        (r"\bfetch\b.+url|get.+webpage|download.+page|browse\s+to|visit\s+http",
+         "web_fetch", {}),
+        (r"\bopen\b.+(url|link|http|website|browser)|go\s+to\s+http",
+         "open_url", {}),
+        # voice
+        (r"\bspeak\b|say\s+.{3,}|read.*aloud|text.to.speech|tts",
+         "speak", {}),
+        (r"\blist.*voice|available.*voice|voice.*option",
+         "list_voices", {}),
+        (r"\bset.*voice|change.*voice|switch.*voice",
+         "set_voice", {}),
+        # screenshot
+        (r"\bscreenshot|screen.*capture|capture.*screen|take.*picture.*screen",
+         "screenshot", {}),
+        # clipboard
+        (r"\bclipboard.*read|read.*clipboard|paste.*content|what.*clipboard",
+         "clipboard_read", {}),
+        (r"\bclipboard.*write|copy.*clipboard|write.*clipboard",
+         "clipboard_write", {}),
+        # resilience
+        (r"\bcircuit.breaker|service.*status.*breaker|breaker.*status",
+         "circuit_breaker_status", {}),
+        (r"\breset.*circuit|circuit.*reset",
+         "reset_circuit_breaker", {}),
         (r"\bcpu\b|\bmemory\b|\bdisk\b|system\s+stat|resource",
          "system_snapshot", {}),
         (r"\bprocesses?\b|running programs?|what.+running",
@@ -350,11 +449,69 @@ class Agent:
             return {"name_filter": name}
         if tool_name == "ask_ollama":
             return {"prompt": goal, "model": self.ollama_model}
+        # Mesh tools
+        if tool_name == "mesh_ask":
+            return {"question": goal}
+        if tool_name == "mesh_install_instructions":
+            backend_m = re.search(
+                r"\b(triposg|trellis|triposr|shap[_\s]?e|instantmesh)\b", goal.lower()
+            )
+            return {"backend": backend_m.group(1).replace(" ", "_") if backend_m else "triposg"}
+        if tool_name in ("mesh_free_image_to_3d", "mesh_meshy_image_to_3d"):
+            backend_m = re.search(
+                r"\b(triposg|trellis|triposr|shap[_\s]?e|instantmesh)\b", goal.lower()
+            )
+            args: Dict[str, Any] = {"image_path": path or first_quoted or ""}
+            if backend_m and tool_name == "mesh_free_image_to_3d":
+                args["backend"] = backend_m.group(1).replace(" ", "_")
+            return args
+        if tool_name == "mesh_validate":
+            return {"mesh_path": path or first_quoted or ""}
+        # Web tools
+        if tool_name in ("web_fetch", "open_url"):
+            url_m = re.search(r"https?://\S+", goal)
+            url = url_m.group(0).rstrip(".,;)") if url_m else first_quoted or ""
+            return {"url": url}
+        # Voice tools
+        if tool_name == "speak":
+            # Use whatever comes after "say" or "speak"
+            say_m = re.search(r"(?:say|speak|read\s+aloud)\s+[\"']?(.+)", goal, re.IGNORECASE)
+            text = say_m.group(1).strip("\"'") if say_m else first_quoted or goal
+            return {"text": text}
+        if tool_name == "set_voice":
+            return {"voice_id": first_quoted or path or ""}
+        if tool_name == "clipboard_write":
+            return {"text": first_quoted or ""}
+        if tool_name == "reset_circuit_breaker":
+            svc_m = re.search(
+                r"\b(ollama|lmstudio|comfyui|sdwebui|openwebui|localai|textgen|oobabooga|jan|llamacpp)\b",
+                goal.lower()
+            )
+            return {"service": svc_m.group(1) if svc_m else "ollama"}
         return {}
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _prune_messages(self, messages: List[Dict[str, str]]) -> None:
+        """Keep context within ``max_context_messages``.
+
+        Always preserves the system prompt (index 0) and the most
+        recent ``max_context_messages - 1`` messages so the model
+        retains context about the current task.
+        """
+        limit = self.max_context_messages
+        if len(messages) <= limit:
+            return
+        system = messages[0]
+        # Take (limit - 1) most recent messages so that after re-inserting
+        # the system prompt the total is exactly `limit` messages.
+        recent = messages[-(limit - 1):]
+        messages.clear()
+        messages.append(system)
+        messages.extend(recent)
+        logger.debug("Context window pruned to %d messages.", len(messages))
 
     def _ollama_available(self) -> bool:
         try:

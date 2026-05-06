@@ -492,3 +492,486 @@ def _register_builtin_tools(reg: ToolRegistry) -> None:
         handler=_list_ollama_models,
         category="ai",
     ))
+
+    # ------------------------------------------------------------------ #
+    # MESH TOOLS                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _mesh_ask(question: str) -> ToolResult:
+        from .mesh_engine import MeshEngine  # noqa: PLC0415
+        engine = MeshEngine()
+        answer = engine.ask_knowledge(question)
+        return _ok("mesh_ask", answer, data={"question": question, "answer": answer})
+
+    reg.register(Tool(
+        name="mesh_ask",
+        description=(
+            "Ask Mossy a Fallout 4 mesh / modding question. "
+            "Covers polygon budgets, NIF format, textures, LOD, collision, workflow and free tools."
+        ),
+        params=[ToolParam("question", "str", "The modding or mesh question.")],
+        handler=_mesh_ask,
+        category="mesh",
+    ))
+
+    def _mesh_workflow() -> ToolResult:
+        from .mesh_engine import MeshEngine  # noqa: PLC0415
+        engine = MeshEngine()
+        text = engine.get_workflow()
+        return _ok("mesh_workflow", text)
+
+    reg.register(Tool(
+        name="mesh_workflow",
+        description="Show the recommended image-to-Fallout-4-mesh workflow (free tools only).",
+        params=[],
+        handler=_mesh_workflow,
+        category="mesh",
+    ))
+
+    def _mesh_list_free_tools() -> ToolResult:
+        from .mesh_engine import FreeImage3DClient  # noqa: PLC0415
+        text = FreeImage3DClient.list_backends()
+        return _ok("mesh_list_free_tools", text)
+
+    reg.register(Tool(
+        name="mesh_list_free_tools",
+        description=(
+            "List all free open-source image-to-3D tools Mossy supports "
+            "(TripoSG, TRELLIS, TripoSR, Shap-E — all from GitHub/HuggingFace)."
+        ),
+        params=[],
+        handler=_mesh_list_free_tools,
+        category="mesh",
+    ))
+
+    def _mesh_install_instructions(backend: str) -> ToolResult:
+        from .mesh_engine import FreeImage3DClient  # noqa: PLC0415
+        text = FreeImage3DClient.install_instructions(backend)
+        return _ok("mesh_install_instructions", text, data={"backend": backend})
+
+    reg.register(Tool(
+        name="mesh_install_instructions",
+        description=(
+            "Get step-by-step install instructions for a free image-to-3D backend. "
+            "Options: triposg, trellis, triposr, shap_e."
+        ),
+        params=[
+            ToolParam("backend", "str",
+                      "Backend name: triposg (recommended), trellis, triposr, or shap_e."),
+        ],
+        handler=_mesh_install_instructions,
+        category="mesh",
+    ))
+
+    def _mesh_free_image_to_3d(
+        image_path: str,
+        output_dir: str = "",
+        backend: str = "triposg",
+        faces: int = 0,
+    ) -> ToolResult:
+        from .mesh_engine import MeshEngine  # noqa: PLC0415
+        engine = MeshEngine()
+        kwargs = {}
+        if faces > 0:
+            kwargs["faces"] = faces
+        result = engine.free_image_to_3d(
+            image_path=image_path,
+            output_dir=output_dir or None,
+            backend=backend,
+            **kwargs,
+        )
+        return _ok("mesh_free_image_to_3d", result.summary, data={
+            "backend": result.backend,
+            "mesh_path": result.mesh_path,
+            "exported_files": result.exported_files,
+            "success": result.success,
+        }) if result.success else _err("mesh_free_image_to_3d", result.error)
+
+    reg.register(Tool(
+        name="mesh_free_image_to_3d",
+        description=(
+            "Convert an image to a 3D mesh using a free open-source AI model "
+            "(TripoSG by default — MIT license, 8 GB VRAM, best free quality). "
+            "Outputs GLB/OBJ ready for Blender → NIF export."
+        ),
+        params=[
+            ToolParam("image_path", "str", "Path to the input image (PNG or JPEG)."),
+            ToolParam("output_dir", "str", "Where to save the output mesh.",
+                      required=False, default=""),
+            ToolParam("backend", "str",
+                      "Free backend: triposg (default), trellis, triposr, shap_e.",
+                      required=False, default="triposg"),
+            ToolParam("faces", "int",
+                      "Max triangle count (0 = model default). e.g. 5000 for FO4 weapon.",
+                      required=False, default=0),
+        ],
+        handler=_mesh_free_image_to_3d,
+        category="mesh",
+    ))
+
+    def _mesh_meshy_image_to_3d(
+        image_path: str,
+        output_dir: str = "",
+        api_key: str = "",
+        download_fmt: str = "obj",
+        target_polycount: int = 10000,
+    ) -> ToolResult:
+        from .mesh_engine import MeshEngine  # noqa: PLC0415
+        engine = MeshEngine()
+        result = engine.meshy_image_to_3d(
+            image_path=image_path,
+            output_dir=output_dir or None,
+            api_key=api_key or None,
+            download_fmt=download_fmt,
+            target_polycount=target_polycount,
+        )
+        if result.success:
+            return _ok("mesh_meshy_image_to_3d", result.summary, data={
+                "mesh_path": result.mesh_path,
+                "exported_files": result.exported_files,
+            })
+        return _err("mesh_meshy_image_to_3d",
+                    "; ".join(result.errors) or "Meshy conversion failed")
+
+    reg.register(Tool(
+        name="mesh_meshy_image_to_3d",
+        description=(
+            "Convert an image to a 3D mesh using the Meshy API (paid subscription). "
+            "Requires a Meshy API key (set MESHY_API_KEY env var or pass api_key)."
+        ),
+        params=[
+            ToolParam("image_path", "str", "Path to the input image (PNG or JPEG)."),
+            ToolParam("output_dir", "str", "Where to save the downloaded mesh.",
+                      required=False, default=""),
+            ToolParam("api_key", "str", "Meshy API key (or use MESHY_API_KEY env var).",
+                      required=False, default=""),
+            ToolParam("download_fmt", "str", "Output format: obj, glb, fbx, usdz.",
+                      required=False, default="obj"),
+            ToolParam("target_polycount", "int",
+                      "Polygon budget hint for Meshy (default 10000).",
+                      required=False, default=10000),
+        ],
+        handler=_mesh_meshy_image_to_3d,
+        category="mesh",
+    ))
+
+    def _mesh_validate(mesh_path: str, asset_type: str = "settlement_object_medium") -> ToolResult:
+        from .mesh_engine import MeshEngine  # noqa: PLC0415
+        engine = MeshEngine()
+        validation = engine.validate_mesh(mesh_path, asset_type)
+        return _ok("mesh_validate", str(validation), data={
+            "passed": validation.passed,
+            "poly_count": validation.poly_count,
+            "issues": validation.issues,
+        })
+
+    reg.register(Tool(
+        name="mesh_validate",
+        description=(
+            "Validate a mesh file against Fallout 4 requirements "
+            "(polygon budget, UVs, normals, watertight check)."
+        ),
+        params=[
+            ToolParam("mesh_path", "str", "Path to OBJ, PLY, GLB, or STL file."),
+            ToolParam("asset_type", "str",
+                      "FO4 asset type for budget check: weapon, armor_piece, "
+                      "settlement_object_medium, character_head, etc.",
+                      required=False, default="settlement_object_medium"),
+        ],
+        handler=_mesh_validate,
+        category="mesh",
+    ))
+
+    def _mesh_check_deps() -> ToolResult:
+        from .mesh_engine import MeshEngine  # noqa: PLC0415
+        engine = MeshEngine()
+        text = engine.check_dependencies()
+        return _ok("mesh_check_deps", text)
+
+    reg.register(Tool(
+        name="mesh_check_deps",
+        description=(
+            "Check which mesh pipeline packages are installed and which free "
+            "3D model repos have been cloned."
+        ),
+        params=[],
+        handler=_mesh_check_deps,
+        category="mesh",
+    ))
+
+    # ------------------------------------------------------------------ #
+    # WEB TOOLS                                                            #
+    # ------------------------------------------------------------------ #
+
+    def _web_fetch(url: str, max_chars: int = 4000) -> ToolResult:
+        """Fetch a URL and return the text content."""
+        import urllib.request as _urllib  # noqa: PLC0415
+        import urllib.error as _urllib_err  # noqa: PLC0415
+        import urllib.parse as _urlparse  # noqa: PLC0415
+        import html  # noqa: PLC0415
+        import re as _re  # noqa: PLC0415
+        # Validate URL scheme — only allow http/https to prevent SSRF
+        parsed = _urlparse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return _err("web_fetch", f"Disallowed URL scheme {parsed.scheme!r}. Only http/https are allowed.")
+        try:
+            req = _urllib.Request(
+                url,
+                headers={"User-Agent": "AI-Helper/0.1 (+https://github.com/AI-Helper)"},
+            )
+            with _urllib.urlopen(req, timeout=15) as resp:  # noqa: S310
+                raw = resp.read().decode("utf-8", errors="replace")
+            # Strip HTML tags for readability
+            text = _re.sub(r"<[^>]+>", " ", raw)
+            text = html.unescape(text)
+            text = _re.sub(r"\s{2,}", " ", text).strip()
+            return _ok("web_fetch", text[:max_chars], data={"url": url, "length": len(text)})
+        except _urllib_err.HTTPError as exc:
+            return _err("web_fetch", f"HTTP {exc.code} {exc.reason} — {url}")
+        except Exception as exc:  # noqa: BLE001
+            return _err("web_fetch", str(exc))
+
+    reg.register(Tool(
+        name="web_fetch",
+        description="Fetch a URL and return its text content (HTML stripped).",
+        params=[
+            ToolParam("url", "str", "The URL to fetch."),
+            ToolParam("max_chars", "int", "Maximum characters to return (default 4000).",
+                      required=False, default=4000),
+        ],
+        handler=_web_fetch,
+        category="web",
+    ))
+
+    def _open_url(url: str) -> ToolResult:
+        """Open a URL in the system default browser."""
+        import webbrowser  # noqa: PLC0415
+        try:
+            webbrowser.open(url)
+            return _ok("open_url", f"Opened in browser: {url}", data={"url": url})
+        except Exception as exc:  # noqa: BLE001
+            return _err("open_url", str(exc))
+
+    reg.register(Tool(
+        name="open_url",
+        description="Open a URL in the system default web browser.",
+        params=[ToolParam("url", "str", "The URL to open.")],
+        handler=_open_url,
+        category="web",
+    ))
+
+    # ------------------------------------------------------------------ #
+    # VOICE TOOLS                                                          #
+    # ------------------------------------------------------------------ #
+
+    def _speak(text: str, rate: int = 0, volume: float = 0.0) -> ToolResult:
+        """Speak text aloud via the TTS engine."""
+        from .voice import Speaker  # noqa: PLC0415
+        speaker = Speaker()
+        if rate > 0:
+            speaker.set_rate(rate)
+        if 0.0 < volume <= 1.0:
+            speaker.set_volume(volume)
+        speaker.speak(text)
+        return _ok("speak", f"Speaking: {text[:80]}…" if len(text) > 80 else f"Speaking: {text}")
+
+    reg.register(Tool(
+        name="speak",
+        description="Speak text aloud using the system TTS engine (pyttsx3 or OS fallback).",
+        params=[
+            ToolParam("text", "str", "Text to speak."),
+            ToolParam("rate", "int", "Speech rate in words per minute (0 = default 175).",
+                      required=False, default=0),
+            ToolParam("volume", "float", "Volume 0.0–1.0 (0.0 = default).",
+                      required=False, default=0.0),
+        ],
+        handler=_speak,
+        category="voice",
+    ))
+
+    def _list_voices() -> ToolResult:
+        """List available TTS voices."""
+        from .voice import Speaker  # noqa: PLC0415
+        speaker = Speaker(enabled=False)
+        voices = speaker.list_voices()
+        if not voices:
+            return _ok("list_voices", "No pyttsx3 voices found (pyttsx3 may not be installed).", data=[])
+        text = "Available TTS voices:\n" + "\n".join(f"  {v}" for v in voices)
+        return _ok("list_voices", text, data=voices)
+
+    reg.register(Tool(
+        name="list_voices",
+        description="List all available text-to-speech voices on this system.",
+        params=[],
+        handler=_list_voices,
+        category="voice",
+    ))
+
+    def _set_voice(voice_id: str) -> ToolResult:
+        """Select a TTS voice by name fragment."""
+        from .voice import Speaker  # noqa: PLC0415
+        speaker = Speaker()
+        speaker.set_voice(voice_id)
+        return _ok("set_voice", f"Voice set to: {voice_id!r}")
+
+    reg.register(Tool(
+        name="set_voice",
+        description="Select a text-to-speech voice by name or id fragment (e.g. 'zira', 'david', 'daniel').",
+        params=[ToolParam("voice_id", "str", "Name or id fragment of the desired voice.")],
+        handler=_set_voice,
+        category="voice",
+    ))
+
+    # ------------------------------------------------------------------ #
+    # SCREENSHOT                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _screenshot(output_path: str = "") -> ToolResult:
+        """Take a screenshot and save it to disk."""
+        import time as _time  # noqa: PLC0415
+        from pathlib import Path as _Path  # noqa: PLC0415
+        from .config import get_data_dir  # noqa: PLC0415
+        if not output_path:
+            ts = _time.strftime("%Y%m%d_%H%M%S")
+            output_path = str(get_data_dir() / "screenshots" / f"screenshot_{ts}.png")
+        dest = _Path(output_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # Try PIL/Pillow ImageGrab first (Windows/macOS)
+            from PIL import ImageGrab  # noqa: PLC0415
+            img = ImageGrab.grab()
+            img.save(str(dest))
+            return _ok("screenshot", f"Screenshot saved: {dest}",
+                       data={"path": str(dest), "size": list(img.size)})
+        except ImportError:
+            pass
+        # Fallback: scrot (Linux)
+        import shutil as _shutil  # noqa: PLC0415
+        import subprocess as _subprocess  # noqa: PLC0415
+        if _shutil.which("scrot"):
+            proc = _subprocess.run(
+                ["scrot", str(dest)], capture_output=True, text=True, timeout=10
+            )
+            if proc.returncode != 0:
+                logger.warning("scrot failed (rc=%d): %s", proc.returncode, proc.stderr.strip())
+            elif dest.exists():
+                return _ok("screenshot", f"Screenshot saved: {dest}", data={"path": str(dest)})
+        # Fallback: gnome-screenshot
+        if _shutil.which("gnome-screenshot"):
+            proc = _subprocess.run(
+                ["gnome-screenshot", "-f", str(dest)], capture_output=True, text=True, timeout=10
+            )
+            if proc.returncode != 0:
+                logger.warning("gnome-screenshot failed (rc=%d): %s",
+                               proc.returncode, proc.stderr.strip())
+            elif dest.exists():
+                return _ok("screenshot", f"Screenshot saved: {dest}", data={"path": str(dest)})
+        return _err("screenshot",
+                    "No screenshot tool available. Install Pillow (pip install Pillow) or scrot.")
+
+    reg.register(Tool(
+        name="screenshot",
+        description=(
+            "Take a screenshot of the current screen and save it to disk. "
+            "Requires Pillow (Windows/macOS) or scrot/gnome-screenshot (Linux)."
+        ),
+        params=[
+            ToolParam("output_path", "str",
+                      "Where to save the PNG. Defaults to AI-Helper/Data/screenshots/<timestamp>.png.",
+                      required=False, default=""),
+        ],
+        handler=_screenshot,
+        category="system",
+    ))
+
+    # ------------------------------------------------------------------ #
+    # CLIPBOARD TOOLS                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _clipboard_read() -> ToolResult:
+        """Read current clipboard contents."""
+        try:
+            import pyperclip  # noqa: PLC0415
+            text = pyperclip.paste() or ""
+            return _ok("clipboard_read", text or "(clipboard is empty)", data={"content": text})
+        except Exception as exc:  # noqa: BLE001
+            return _err("clipboard_read", f"Could not read clipboard: {exc}")
+
+    reg.register(Tool(
+        name="clipboard_read",
+        description="Read the current clipboard contents and return the text.",
+        params=[],
+        handler=_clipboard_read,
+        category="system",
+    ))
+
+    def _clipboard_write(text: str) -> ToolResult:
+        """Write text to the clipboard."""
+        try:
+            import pyperclip  # noqa: PLC0415
+            pyperclip.copy(text)
+            preview = text[:80] + "…" if len(text) > 80 else text
+            return _ok("clipboard_write", f"Copied to clipboard: {preview}")
+        except Exception as exc:  # noqa: BLE001
+            return _err("clipboard_write", f"Could not write clipboard: {exc}")
+
+    reg.register(Tool(
+        name="clipboard_write",
+        description="Write text to the system clipboard.",
+        params=[ToolParam("text", "str", "Text to copy to the clipboard.")],
+        handler=_clipboard_write,
+        category="system",
+    ))
+
+    # ------------------------------------------------------------------ #
+    # RESILIENCE / DIAGNOSTICS TOOLS                                       #
+    # ------------------------------------------------------------------ #
+
+    def _circuit_breaker_status() -> ToolResult:
+        """Show status of all AI service circuit breakers."""
+        try:
+            from .ai_integrations import _BREAKERS  # noqa: PLC0415
+            lines = ["Circuit breaker status for AI services:"]
+            for name, cb in _BREAKERS.items():
+                icon = "✓" if not cb.is_open else "✗ OPEN"
+                lines.append(
+                    f"  {name:<14} {icon}  (failures={cb._failure_count}/{cb.failure_threshold})"
+                )
+            return _ok("circuit_breaker_status", "\n".join(lines))
+        except Exception as exc:  # noqa: BLE001
+            return _err("circuit_breaker_status", str(exc))
+
+    reg.register(Tool(
+        name="circuit_breaker_status",
+        description="Show whether each AI service circuit breaker is open (failing fast) or closed (healthy).",
+        params=[],
+        handler=_circuit_breaker_status,
+        category="ai",
+    ))
+
+    def _reset_circuit_breaker(service: str) -> ToolResult:
+        """Manually close a circuit breaker for a service."""
+        try:
+            from .ai_integrations import _BREAKERS  # noqa: PLC0415
+            cb = _BREAKERS.get(service)
+            if cb is None:
+                valid = ", ".join(_BREAKERS)
+                return _err("reset_circuit_breaker",
+                            f"Unknown service {service!r}. Valid: {valid}")
+            cb.reset()
+            return _ok("reset_circuit_breaker", f"Circuit breaker for {service!r} reset to CLOSED.")
+        except Exception as exc:  # noqa: BLE001
+            return _err("reset_circuit_breaker", str(exc))
+
+    reg.register(Tool(
+        name="reset_circuit_breaker",
+        description="Manually close (reset) a circuit breaker for an AI service after it has recovered.",
+        params=[
+            ToolParam("service", "str",
+                      "Service name: ollama, lmstudio, comfyui, sdwebui, openwebui, "
+                      "localai, textgen, oobabooga, jan, llamacpp."),
+        ],
+        handler=_reset_circuit_breaker,
+        category="ai",
+    ))
+

@@ -18,7 +18,96 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = ["pynvml"]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "pytest-mock>=3.11"]
+
+# ---------------------------------------------------------------------------
+# Mesh engine — free, open-source packages for image-to-mesh conversion.
+# All sources: GitHub / HuggingFace / PyPI.  No paid services required.
+# Install with:  pip install "ai-helper[mesh]"
+# ---------------------------------------------------------------------------
+mesh = [
+    "opencv-python>=4.8.0",
+    "open3d>=0.18.0",
+    "trimesh>=4.0.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+    "scipy>=1.11.0",
+    "scikit-image>=0.21.0",
+    "pyffi>=2.2.4.dev3",
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "diffusers>=0.27.0",
+    "einops>=0.7.0",
+    "omegaconf>=2.3.0",
+    "huggingface_hub>=0.20.0",
+    "requests>=2.32.0",
+    "tqdm>=4.66.0",
+    "pymeshlab>=2023.12",
+    "moderngl>=5.10.0",
+]
+
+# ---------------------------------------------------------------------------
+# Free AI image-to-3D model inference (HuggingFace depth estimation, etc.)
+# TripoSG / TRELLIS / TripoSR / InstantMesh / Shap-E require cloning their
+# GitHub repos separately — run:
+#   python -m ai_helper --ask "install instructions triposg"
+# ---------------------------------------------------------------------------
+mesh-ai = [
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "diffusers>=0.27.0",
+    "einops>=0.7.0",
+    "Pillow>=10.0.0",
+    "huggingface_hub>=0.20.0",
+]
+
+# ---------------------------------------------------------------------------
+# LLM fine-tuning — fine-tune Gemma 4, Phi-4, LLaMA 3.x, Mistral, Qwen 2.5
+# locally with LoRA adapters.  Unsloth must be installed separately with the
+# correct CUDA suffix:  pip install "unsloth[cu121]"
+# Install with:  pip install "ai-helper[gemma]"
+# ---------------------------------------------------------------------------
+gemma = [
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "datasets>=2.14.0",
+    "trl>=0.7.0",
+    "bitsandbytes>=0.41.0",
+    "peft>=0.7.0",
+    "accelerate>=0.25.0",
+    "huggingface_hub>=0.20.0",
+]
+
+# Everything (mesh + GPU monitoring + LLM fine-tuning)
+# Install with:  pip install "ai-helper[all]"
+all = [
+    "pynvml",
+    # Mesh
+    "opencv-python>=4.8.0",
+    "open3d>=0.18.0",
+    "trimesh>=4.0.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+    "scipy>=1.11.0",
+    "scikit-image>=0.21.0",
+    "pyffi>=2.2.4.dev3",
+    "diffusers>=0.27.0",
+    "einops>=0.7.0",
+    "omegaconf>=2.3.0",
+    "requests>=2.32.0",
+    "tqdm>=4.66.0",
+    "pymeshlab>=2023.12",
+    "moderngl>=5.10.0",
+    # LLM fine-tuning
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "datasets>=2.14.0",
+    "trl>=0.7.0",
+    "bitsandbytes>=0.41.0",
+    "peft>=0.7.0",
+    "accelerate>=0.25.0",
+    "huggingface_hub>=0.20.0",
+]
 
 [project.scripts]
 ai-helper = "ai_helper.main:main"
