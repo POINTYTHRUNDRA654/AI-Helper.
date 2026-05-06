@@ -273,6 +273,26 @@ class Agent:
          "list_ollama_models", {}),
         (r"\bollama\b|local\s+llm|local\s+model|ask.*model",
          "ask_ollama", {}),
+        # mesh / 3d patterns — specific ones first
+        (r"\bmesh.*depend|depend.*mesh|install.*mesh|mesh.*install|check.*mesh",
+         "mesh_check_deps", {}),
+        (r"\bfree.*3d\s+tool|list.*3d\s+tool|3d\s+tool.*free|triposg|triposr|trellis|shap.e|instantmesh",
+         "mesh_list_free_tools", {}),
+        (r"\binstall.*triposg|install.*trellis|install.*triposr|install.*shap.e|how.*install.*3d",
+         "mesh_install_instructions", {}),
+        (r"\b(triposg|trellis|triposr|shap.e|free\s+3d|free.*mesh).*convert|convert.*image.*3d.*free",
+         "mesh_free_image_to_3d", {}),
+        (r"\bmeshy\b.*convert|convert.*meshy|meshy.*image|image.*meshy",
+         "mesh_meshy_image_to_3d", {}),
+        (r"\bconvert.*image.*3d|image.*to.*3d|scan.*image.*mesh|photo.*to.*mesh|image.*mesh",
+         "mesh_free_image_to_3d", {}),
+        (r"\bvalidate.*mesh|check.*mesh.*fallout|mesh.*valid|polygon.*budget",
+         "mesh_validate", {}),
+        (r"\bworkflow.*mesh|mesh.*workflow|how.*make.*nif|image.*fallout.*4|fallout.*mesh",
+         "mesh_workflow", {}),
+        (r"\bnif\b|bstriShape|bsfadenode|collision.*mesh|mesh.*nif|fallout.*4.*mesh"
+         r"|polygon.*fallout|texture.*fallout|lod.*fallout",
+         "mesh_ask", {}),
         (r"\bcpu\b|\bmemory\b|\bdisk\b|system\s+stat|resource",
          "system_snapshot", {}),
         (r"\bprocesses?\b|running programs?|what.+running",
@@ -350,6 +370,24 @@ class Agent:
             return {"name_filter": name}
         if tool_name == "ask_ollama":
             return {"prompt": goal, "model": self.ollama_model}
+        # Mesh tools
+        if tool_name == "mesh_ask":
+            return {"question": goal}
+        if tool_name == "mesh_install_instructions":
+            backend_m = re.search(
+                r"\b(triposg|trellis|triposr|shap[_\s]?e|instantmesh)\b", goal.lower()
+            )
+            return {"backend": backend_m.group(1).replace(" ", "_") if backend_m else "triposg"}
+        if tool_name in ("mesh_free_image_to_3d", "mesh_meshy_image_to_3d"):
+            backend_m = re.search(
+                r"\b(triposg|trellis|triposr|shap[_\s]?e|instantmesh)\b", goal.lower()
+            )
+            args: Dict[str, Any] = {"image_path": path or first_quoted or ""}
+            if backend_m and tool_name == "mesh_free_image_to_3d":
+                args["backend"] = backend_m.group(1).replace(" ", "_")
+            return args
+        if tool_name == "mesh_validate":
+            return {"mesh_path": path or first_quoted or ""}
         return {}
 
     # ------------------------------------------------------------------

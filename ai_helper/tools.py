@@ -492,3 +492,210 @@ def _register_builtin_tools(reg: ToolRegistry) -> None:
         handler=_list_ollama_models,
         category="ai",
     ))
+
+    # ------------------------------------------------------------------ #
+    # MESH TOOLS                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _mesh_ask(question: str) -> ToolResult:
+        from .mesh_engine import MeshEngine  # noqa: PLC0415
+        engine = MeshEngine()
+        answer = engine.ask_knowledge(question)
+        return _ok("mesh_ask", answer, data={"question": question, "answer": answer})
+
+    reg.register(Tool(
+        name="mesh_ask",
+        description=(
+            "Ask Mossy a Fallout 4 mesh / modding question. "
+            "Covers polygon budgets, NIF format, textures, LOD, collision, workflow and free tools."
+        ),
+        params=[ToolParam("question", "str", "The modding or mesh question.")],
+        handler=_mesh_ask,
+        category="mesh",
+    ))
+
+    def _mesh_workflow() -> ToolResult:
+        from .mesh_engine import MeshEngine  # noqa: PLC0415
+        engine = MeshEngine()
+        text = engine.get_workflow()
+        return _ok("mesh_workflow", text)
+
+    reg.register(Tool(
+        name="mesh_workflow",
+        description="Show the recommended image-to-Fallout-4-mesh workflow (free tools only).",
+        params=[],
+        handler=_mesh_workflow,
+        category="mesh",
+    ))
+
+    def _mesh_list_free_tools() -> ToolResult:
+        from .mesh_engine import FreeImage3DClient  # noqa: PLC0415
+        text = FreeImage3DClient.list_backends()
+        return _ok("mesh_list_free_tools", text)
+
+    reg.register(Tool(
+        name="mesh_list_free_tools",
+        description=(
+            "List all free open-source image-to-3D tools Mossy supports "
+            "(TripoSG, TRELLIS, TripoSR, Shap-E — all from GitHub/HuggingFace)."
+        ),
+        params=[],
+        handler=_mesh_list_free_tools,
+        category="mesh",
+    ))
+
+    def _mesh_install_instructions(backend: str) -> ToolResult:
+        from .mesh_engine import FreeImage3DClient  # noqa: PLC0415
+        text = FreeImage3DClient.install_instructions(backend)
+        return _ok("mesh_install_instructions", text, data={"backend": backend})
+
+    reg.register(Tool(
+        name="mesh_install_instructions",
+        description=(
+            "Get step-by-step install instructions for a free image-to-3D backend. "
+            "Options: triposg, trellis, triposr, shap_e."
+        ),
+        params=[
+            ToolParam("backend", "str",
+                      "Backend name: triposg (recommended), trellis, triposr, or shap_e."),
+        ],
+        handler=_mesh_install_instructions,
+        category="mesh",
+    ))
+
+    def _mesh_free_image_to_3d(
+        image_path: str,
+        output_dir: str = "",
+        backend: str = "triposg",
+        faces: int = 0,
+    ) -> ToolResult:
+        from .mesh_engine import MeshEngine  # noqa: PLC0415
+        engine = MeshEngine()
+        kwargs = {}
+        if faces > 0:
+            kwargs["faces"] = faces
+        result = engine.free_image_to_3d(
+            image_path=image_path,
+            output_dir=output_dir or None,
+            backend=backend,
+            **kwargs,
+        )
+        return _ok("mesh_free_image_to_3d", result.summary, data={
+            "backend": result.backend,
+            "mesh_path": result.mesh_path,
+            "exported_files": result.exported_files,
+            "success": result.success,
+        }) if result.success else _err("mesh_free_image_to_3d", result.error)
+
+    reg.register(Tool(
+        name="mesh_free_image_to_3d",
+        description=(
+            "Convert an image to a 3D mesh using a free open-source AI model "
+            "(TripoSG by default — MIT license, 8 GB VRAM, best free quality). "
+            "Outputs GLB/OBJ ready for Blender → NIF export."
+        ),
+        params=[
+            ToolParam("image_path", "str", "Path to the input image (PNG or JPEG)."),
+            ToolParam("output_dir", "str", "Where to save the output mesh.",
+                      required=False, default=""),
+            ToolParam("backend", "str",
+                      "Free backend: triposg (default), trellis, triposr, shap_e.",
+                      required=False, default="triposg"),
+            ToolParam("faces", "int",
+                      "Max triangle count (0 = model default). e.g. 5000 for FO4 weapon.",
+                      required=False, default=0),
+        ],
+        handler=_mesh_free_image_to_3d,
+        category="mesh",
+    ))
+
+    def _mesh_meshy_image_to_3d(
+        image_path: str,
+        output_dir: str = "",
+        api_key: str = "",
+        download_fmt: str = "obj",
+        target_polycount: int = 10000,
+    ) -> ToolResult:
+        from .mesh_engine import MeshEngine  # noqa: PLC0415
+        engine = MeshEngine()
+        result = engine.meshy_image_to_3d(
+            image_path=image_path,
+            output_dir=output_dir or None,
+            api_key=api_key or None,
+            download_fmt=download_fmt,
+            target_polycount=target_polycount,
+        )
+        if result.success:
+            return _ok("mesh_meshy_image_to_3d", result.summary, data={
+                "mesh_path": result.mesh_path,
+                "exported_files": result.exported_files,
+            })
+        return _err("mesh_meshy_image_to_3d",
+                    "; ".join(result.errors) or "Meshy conversion failed")
+
+    reg.register(Tool(
+        name="mesh_meshy_image_to_3d",
+        description=(
+            "Convert an image to a 3D mesh using the Meshy API (paid subscription). "
+            "Requires a Meshy API key (set MESHY_API_KEY env var or pass api_key)."
+        ),
+        params=[
+            ToolParam("image_path", "str", "Path to the input image (PNG or JPEG)."),
+            ToolParam("output_dir", "str", "Where to save the downloaded mesh.",
+                      required=False, default=""),
+            ToolParam("api_key", "str", "Meshy API key (or use MESHY_API_KEY env var).",
+                      required=False, default=""),
+            ToolParam("download_fmt", "str", "Output format: obj, glb, fbx, usdz.",
+                      required=False, default="obj"),
+            ToolParam("target_polycount", "int",
+                      "Polygon budget hint for Meshy (default 10000).",
+                      required=False, default=10000),
+        ],
+        handler=_mesh_meshy_image_to_3d,
+        category="mesh",
+    ))
+
+    def _mesh_validate(mesh_path: str, asset_type: str = "settlement_object_medium") -> ToolResult:
+        from .mesh_engine import MeshEngine  # noqa: PLC0415
+        engine = MeshEngine()
+        validation = engine.validate_mesh(mesh_path, asset_type)
+        return _ok("mesh_validate", str(validation), data={
+            "passed": validation.passed,
+            "poly_count": validation.poly_count,
+            "issues": validation.issues,
+        })
+
+    reg.register(Tool(
+        name="mesh_validate",
+        description=(
+            "Validate a mesh file against Fallout 4 requirements "
+            "(polygon budget, UVs, normals, watertight check)."
+        ),
+        params=[
+            ToolParam("mesh_path", "str", "Path to OBJ, PLY, GLB, or STL file."),
+            ToolParam("asset_type", "str",
+                      "FO4 asset type for budget check: weapon, armor_piece, "
+                      "settlement_object_medium, character_head, etc.",
+                      required=False, default="settlement_object_medium"),
+        ],
+        handler=_mesh_validate,
+        category="mesh",
+    ))
+
+    def _mesh_check_deps() -> ToolResult:
+        from .mesh_engine import MeshEngine  # noqa: PLC0415
+        engine = MeshEngine()
+        text = engine.check_dependencies()
+        return _ok("mesh_check_deps", text)
+
+    reg.register(Tool(
+        name="mesh_check_deps",
+        description=(
+            "Check which mesh pipeline packages are installed and which free "
+            "3D model repos have been cloned."
+        ),
+        params=[],
+        handler=_mesh_check_deps,
+        category="mesh",
+    ))
+

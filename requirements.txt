@@ -5,10 +5,38 @@ pyperclip>=1.11.0
 
 # Gemma 4 fine-tuning with Unsloth
 torch>=2.0.0
-transformers>=4.36.0
+transformers>=4.40.0
 unsloth[colab-new]>=2024.1
 datasets>=2.14.0
 trl>=0.7.0
 bitsandbytes>=0.41.0
 peft>=0.7.0
 accelerate>=0.25.0
+
+# ---------------------------------------------------------------------------
+# Mesh engine — image scanning and Fallout 4 mesh conversion
+# All packages are free and open-source (GitHub / PyPI / HuggingFace).
+# ---------------------------------------------------------------------------
+
+# Core image & 3D processing
+opencv-python>=4.8.0        # image loading, feature detection SIFT/ORB   (github: opencv/opencv)
+open3d>=0.18.0              # point cloud + Poisson mesh reconstruction     (github: isl-org/Open3D)
+trimesh>=4.0.0              # mesh I/O and format conversion                (github: mikedh/trimesh)
+numpy>=1.24.0               # numerical computing
+Pillow>=10.0.0              # image loading
+scipy>=1.11.0               # scientific computing (used by trimesh)
+scikit-image>=0.21.0        # image processing utilities (used by TripoSG)
+pyffi>=2.2.4.dev3           # NIF file format I/O for Fallout 4            (github: niftools/pyffi)
+
+# HuggingFace ecosystem — free model downloads and inference pipelines
+# (torch + transformers already listed above for Gemma)
+diffusers>=0.27.0           # HF diffusion pipelines (TripoSG, TRELLIS, etc.) (github: huggingface/diffusers)
+einops>=0.7.0               # tensor rearrangement, required by most vision models
+omegaconf>=2.3.0            # config management for TripoSG / InstantMesh
+huggingface_hub>=0.20.0     # model downloads from HuggingFace Hub
+
+# Utility
+requests>=2.32.0            # HTTP client (used by HF hub, model downloaders)
+tqdm>=4.66.0                # progress bars during model inference / downloads
+pymeshlab>=2023.12          # mesh processing and polygon reduction         (github: cnr-isti-vclab/meshlab)
+moderngl>=5.10.0            # OpenGL rendering (texture baking for TripoSR)

@@ -20,6 +20,73 @@ dependencies = [
 gpu = ["pynvml"]
 dev = ["pytest>=7.0"]
 
+# ---------------------------------------------------------------------------
+# Mesh engine — free, open-source packages for image-to-mesh conversion.
+# All sources: GitHub / HuggingFace / PyPI.  No paid services required.
+# Install with:  pip install "ai-helper[mesh]"
+# ---------------------------------------------------------------------------
+mesh = [
+    # Core image & 3D processing
+    "opencv-python>=4.8.0",
+    "open3d>=0.18.0",
+    "trimesh>=4.0.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+    "scipy>=1.11.0",
+    "scikit-image>=0.21.0",
+    "pyffi>=2.2.4.dev3",
+    # HuggingFace ecosystem
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "diffusers>=0.27.0",
+    "einops>=0.7.0",
+    "omegaconf>=2.3.0",
+    "huggingface_hub>=0.20.0",
+    # Utilities
+    "requests>=2.32.0",
+    "tqdm>=4.66.0",
+    "pymeshlab>=2023.12",
+    "moderngl>=5.10.0",
+]
+
+# Free AI image-to-3D model inference (HuggingFace depth estimation, etc.)
+# TripoSG / TRELLIS / TripoSR / Shap-E require cloning their GitHub repos
+# separately — see:  python -m ai_helper --ask "install instructions triposg"
+mesh-ai = [
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "diffusers>=0.27.0",
+    "einops>=0.7.0",
+    "Pillow>=10.0.0",
+    "huggingface_hub>=0.20.0",
+]
+
+# Everything (mesh + GPU monitoring + Gemma fine-tuning deps)
+all = [
+    "pynvml",
+    "opencv-python>=4.8.0",
+    "open3d>=0.18.0",
+    "trimesh>=4.0.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+    "scipy>=1.11.0",
+    "scikit-image>=0.21.0",
+    "pyffi>=2.2.4.dev3",
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "diffusers>=0.27.0",
+    "einops>=0.7.0",
+    "omegaconf>=2.3.0",
+    "huggingface_hub>=0.20.0",
+    "requests>=2.32.0",
+    "tqdm>=4.66.0",
+    "pymeshlab>=2023.12",
+    "moderngl>=5.10.0",
+    "accelerate>=0.25.0",
+    "peft>=0.7.0",
+    "datasets>=2.14.0",
+]
+
 [project.scripts]
 ai-helper = "ai_helper.main:main"
 

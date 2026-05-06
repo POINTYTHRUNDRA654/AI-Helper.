@@ -1,30 +1,37 @@
 """Mesh Engine — image-to-mesh scanning and Fallout 4 conversion pipeline.
 
 Mossy's specialised 3D-mesh subsystem.  It handles the full pipeline from
-raw photographs to a game-ready mesh asset for Fallout 4 modding:
+raw photographs to a game-ready mesh asset for Fallout 4 modding.
 
-1. **Scan** — load one or more photographs and extract 2-D image features.
-2. **Reconstruct** — build a 3-D point cloud using multi-view geometry
-   (Structure-from-Motion via feature matching, or depth estimation for
-   single images).
-3. **Mesh** — convert the point cloud into a watertight triangle mesh via
-   Poisson surface reconstruction.
-4. **Export** — write the mesh in formats understood by the Fallout 4 modding
-   toolchain (OBJ/MTL for Blender/NifSkope, and NIF when pyffi is available).
+Free-first design
+-----------------
+Every tool and service used by this module is **free and open-source**,
+downloaded from GitHub or Hugging Face — with one deliberate exception:
 
-Domain knowledge
-----------------
-:class:`Fallout4MeshKnowledge` encodes everything Mossy needs to know about
-Fallout 4 mesh conventions — polygon budgets, texture channels, NIF block
-types, collision requirements, LOD tiers — and can answer questions or
-validate a mesh against those rules.
+* **Meshy** (https://www.meshy.ai) — AI-powered image-to-3D conversion.
+  The user holds a paid annual Meshy subscription, so the
+  :class:`MeshyClient` integrates with the Meshy REST API.  All other
+  services are free.
 
-Graceful degradation
---------------------
-Every heavy dependency (``opencv-python``, ``open3d``, ``trimesh``,
-``numpy``, ``pyffi``) is imported lazily with a clear ``ImportError``
-message.  The :class:`MeshEngine` façade will tell the caller exactly which
-packages are missing rather than crashing silently.
+Free components
+~~~~~~~~~~~~~~~
+* ``opencv-python`` — image loading and feature detection (GitHub: opencv/opencv)
+* ``open3d`` — point cloud + Poisson mesh reconstruction (GitHub: isl-org/Open3D)
+* ``trimesh`` — mesh I/O and format conversion (GitHub: mikedh/trimesh)
+* ``numpy`` / ``scipy`` — numerical computing (free)
+* ``Pillow`` — image loading (GitHub: python-pillow/Pillow)
+* ``pyffi`` — NIF file format I/O (GitHub: niftools/pyffi)
+* HuggingFace ``transformers`` + ``Depth-Anything`` — free monocular depth
+  estimation for single-image workflows (HF: LiheYoung/depth-anything)
+
+Pipeline overview
+-----------------
+1. **Scan** — load photographs; extract 2-D image features with OpenCV.
+2. **Depth** — estimate per-pixel depth via HuggingFace Depth-Anything (free)
+   or Meshy's image-to-3D API (user subscription).
+3. **Reconstruct** — build a 3-D point cloud with Open3D.
+4. **Mesh** — Poisson surface reconstruction → triangle mesh.
+5. **Export** — OBJ/PLY (universal), NIF (pyffi, for Fallout 4 direct import).
 
 Usage (quick-start)
 -------------------
@@ -36,7 +43,7 @@ Usage (quick-start)
     # Ask Mossy a modding question
     answer = engine.ask_knowledge("How many polygons can a weapon mesh use?")
 
-    # Scan images and generate a mesh
+    # Scan images using free pipeline
     result = engine.scan_images(
         image_paths=["front.jpg", "side.jpg", "back.jpg"],
         output_dir="my_mesh_output",
@@ -44,10 +51,17 @@ Usage (quick-start)
     )
     print(result.summary)
 
+    # Use Meshy for high-quality AI image-to-3D (requires API key)
+    result = engine.meshy_image_to_3d(
+        image_path="photo.jpg",
+        output_dir="meshy_output",
+        api_key="your-meshy-api-key",
+    )
+    print(result.summary)
+
     # Validate a mesh file
-    issues = engine.validate_mesh("my_mesh.obj")
-    for issue in issues:
-        print(issue)
+    validation = engine.validate_mesh("my_mesh.obj")
+    print(validation)
 """
 
 from __future__ import annotations
@@ -57,11 +71,1072 @@ import logging
 import os
 import re
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Meshy API client (user's paid subscription)
+# ---------------------------------------------------------------------------
+
+_MESHY_API_BASE = "https://api.meshy.ai/v2"
+
+
+@dataclass
+class MeshyTaskResult:
+    """Result from a Meshy image-to-3D task."""
+    task_id: str
+    status: str               # "PENDING" | "IN_PROGRESS" | "SUCCEEDED" | "FAILED"
+    model_urls: Dict[str, str] = field(default_factory=dict)  # format → download URL
+    thumbnail_url: str = ""
+    progress: int = 0          # 0-100
+    error: str = ""
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status == "SUCCEEDED"
+
+
+class MeshyClient:
+    """Client for the Meshy image-to-3D REST API.
+
+    The user holds a paid Meshy annual subscription.  All other mesh
+    services used by Mossy are free.
+
+    Meshy API docs: https://docs.meshy.ai/api-image-to-3d
+
+    Parameters
+    ----------
+    api_key:
+        Meshy API key.  If not supplied here, read from the
+        ``MESHY_API_KEY`` environment variable.
+    timeout:
+        HTTP request timeout in seconds.
+    poll_interval:
+        Seconds between status-poll requests.
+    max_wait:
+        Maximum seconds to wait for a task to complete.
+
+    Example
+    -------
+    ::
+
+        client = MeshyClient(api_key="your-key")
+        task = client.image_to_3d("photo.jpg")
+        if task.succeeded:
+            client.download_result(task, output_dir="output", fmt="obj")
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        timeout: float = 30.0,
+        poll_interval: float = 5.0,
+        max_wait: float = 600.0,
+    ) -> None:
+        self.api_key = api_key or os.environ.get("MESHY_API_KEY", "")
+        self.timeout = timeout
+        self.poll_interval = poll_interval
+        self.max_wait = max_wait
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def image_to_3d(
+        self,
+        image_path: str,
+        enable_pbr: bool = True,
+        ai_model: str = "meshy-4",
+        topology: str = "quad",
+        target_polycount: int = 10000,
+        should_remesh: bool = True,
+    ) -> MeshyTaskResult:
+        """Submit an image-to-3D task and **wait** for completion.
+
+        Parameters
+        ----------
+        image_path:
+            Local image file (JPEG/PNG).  Uploaded as base-64 data URL.
+        enable_pbr:
+            When ``True``, Meshy generates PBR textures (diffuse, normal,
+            metallic/roughness) suitable for Fallout 4 modding.
+        ai_model:
+            Meshy model version.  ``"meshy-4"`` is the current default.
+        topology:
+            Mesh topology: ``"quad"`` (cleaner for game assets) or ``"triangle"``.
+        target_polycount:
+            Polygon budget passed to Meshy; default 10 000 is a good starting
+            point for Fallout 4 weapons/armour.
+        should_remesh:
+            Whether Meshy automatically remeshes to the target poly count.
+        """
+        if not self.api_key:
+            raise ValueError(
+                "Meshy API key is required.  Set it via the MESHY_API_KEY "
+                "environment variable or pass api_key= to MeshyClient()."
+            )
+
+        # Encode image as data URL
+        data_url = self._image_to_data_url(image_path)
+
+        payload = {
+            "image_url": data_url,
+            "enable_pbr": enable_pbr,
+            "ai_model": ai_model,
+            "topology": topology,
+            "target_polycount": target_polycount,
+            "should_remesh": should_remesh,
+        }
+
+        # Submit task
+        response = self._post("/image-to-3d", payload)
+        task_id = response.get("result", "")
+        if not task_id:
+            return MeshyTaskResult(
+                task_id="",
+                status="FAILED",
+                error=f"Unexpected Meshy response: {response}",
+            )
+
+        logger.info("Meshy task submitted: %s", task_id)
+        return self._poll_until_done(task_id)
+
+    def get_task(self, task_id: str) -> MeshyTaskResult:
+        """Fetch the current status of a Meshy task."""
+        data = self._get(f"/image-to-3d/{task_id}")
+        return self._parse_task(data)
+
+    def download_result(
+        self,
+        task: MeshyTaskResult,
+        output_dir: str,
+        fmt: str = "obj",
+    ) -> Optional[str]:
+        """Download the mesh from a completed task.
+
+        Parameters
+        ----------
+        task:
+            A :class:`MeshyTaskResult` with ``status == "SUCCEEDED"``.
+        output_dir:
+            Directory to save the downloaded file.
+        fmt:
+            Format to download: ``"obj"``, ``"glb"``, ``"fbx"``, ``"usdz"``.
+
+        Returns
+        -------
+        str | None
+            Local file path, or ``None`` if the format is unavailable.
+        """
+        url = task.model_urls.get(fmt)
+        if not url:
+            logger.warning("Meshy task %s has no %r download URL.", task.task_id, fmt)
+            return None
+
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dest = out_dir / f"meshy_{task.task_id}.{fmt}"
+
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            dest.write_bytes(resp.read())
+
+        logger.info("Meshy download saved: %s", dest)
+        return str(dest)
+
+    def download_textures(
+        self, task: MeshyTaskResult, output_dir: str
+    ) -> List[str]:
+        """Download all PBR texture maps from *task* into *output_dir*.
+
+        Returns the list of saved file paths.
+        """
+        saved: List[str] = []
+        texture_urls: Dict[str, str] = task.model_urls.get("textures", {})  # type: ignore[assignment]
+        if not isinstance(texture_urls, dict):
+            return saved
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for channel, url in texture_urls.items():
+            ext = Path(urllib.parse.urlparse(url).path).suffix or ".png"
+            dest = out_dir / f"meshy_{task.task_id}_{channel}{ext}"
+            try:
+                req = urllib.request.Request(url)
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    dest.write_bytes(resp.read())
+                saved.append(str(dest))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to download texture %s: %s", channel, exc)
+        return saved
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _image_to_data_url(self, image_path: str) -> str:
+        import base64  # noqa: PLC0415
+        import mimetypes  # noqa: PLC0415
+        path = Path(image_path)
+        mime, _ = mimetypes.guess_type(str(path))
+        mime = mime or "image/jpeg"
+        data = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{data}"
+
+    def _post(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        url = _MESHY_API_BASE + endpoint
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Meshy API error {exc.code}: {body_text}") from exc
+
+    def _get(self, endpoint: str) -> Dict[str, Any]:
+        url = _MESHY_API_BASE + endpoint
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _poll_until_done(self, task_id: str) -> MeshyTaskResult:
+        deadline = time.monotonic() + self.max_wait
+        while time.monotonic() < deadline:
+            task = self.get_task(task_id)
+            logger.debug("Meshy task %s: %s (%d%%)", task_id, task.status, task.progress)
+            if task.status in ("SUCCEEDED", "FAILED", "EXPIRED"):
+                return task
+            time.sleep(self.poll_interval)
+        return MeshyTaskResult(
+            task_id=task_id,
+            status="FAILED",
+            error=f"Timed out after {self.max_wait}s waiting for Meshy task.",
+        )
+
+    @staticmethod
+    def _parse_task(data: Dict[str, Any]) -> MeshyTaskResult:
+        model_urls = data.get("model_urls") or {}
+        # Normalise nested textures dict if present
+        textures = data.get("texture_urls") or {}
+        if textures:
+            model_urls["textures"] = textures
+        return MeshyTaskResult(
+            task_id=data.get("id", ""),
+            status=data.get("status", "UNKNOWN"),
+            model_urls=model_urls,
+            thumbnail_url=data.get("thumbnail_url", ""),
+            progress=data.get("progress", 0),
+            error=data.get("message", "") if data.get("status") == "FAILED" else "",
+        )
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace depth estimator (free, no subscription needed)
+# ---------------------------------------------------------------------------
+
+
+class HuggingFaceDepthEstimator:
+    """Free monocular depth estimation using models from Hugging Face.
+
+    Uses ``Depth-Anything v2`` by default — a state-of-the-art depth model
+    available for free at ``depth-anything/Depth-Anything-V2-Small-hf``.
+
+    All models are downloaded from HuggingFace on first use and cached
+    locally.  No API key or subscription is required.
+
+    Parameters
+    ----------
+    model_id:
+        HuggingFace model ID.  Defaults to the small Depth-Anything v2
+        variant which runs on CPU in a few seconds per image.
+    device:
+        ``"cuda"`` or ``"cpu"``.  Auto-detected when not specified.
+    cache_dir:
+        Optional local directory to cache downloaded model weights.
+
+    Example
+    -------
+    ::
+
+        estimator = HuggingFaceDepthEstimator()
+        depth = estimator.estimate("photo.jpg")       # numpy array
+        estimator.save_depth_map(depth, "depth.png")  # visualisation
+    """
+
+    # Good free defaults from HuggingFace (ordered by quality/speed tradeoff)
+    FREE_MODELS = {
+        "depth_anything_v2_small": "depth-anything/Depth-Anything-V2-Small-hf",
+        "depth_anything_v2_base": "depth-anything/Depth-Anything-V2-Base-hf",
+        "depth_anything_v2_large": "depth-anything/Depth-Anything-V2-Large-hf",
+        "midas_large": "Intel/dpt-large",
+        "midas_hybrid": "Intel/dpt-hybrid-midas",
+        "zoedepth": "isl-org/ZoeDepth",
+    }
+
+    DEFAULT_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
+
+    def __init__(
+        self,
+        model_id: Optional[str] = None,
+        device: Optional[str] = None,
+        cache_dir: Optional[str] = None,
+    ) -> None:
+        self.model_id = model_id or self.DEFAULT_MODEL
+        self._device = device
+        self.cache_dir = cache_dir
+        self._pipeline: Any = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def estimate(self, image_path: str) -> Any:
+        """Return a depth map as a NumPy array (H×W, float32, normalised 0-1).
+
+        Requires ``transformers``, ``torch``, and ``Pillow``.
+        """
+        try:
+            from transformers import pipeline as hf_pipeline  # noqa: PLC0415
+            from PIL import Image as PILImage  # noqa: PLC0415
+            import numpy as np  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError(
+                "transformers, torch, and Pillow are required for depth estimation.\n"
+                "Install: pip install transformers torch Pillow\n"
+                "All packages are free and available on GitHub / PyPI."
+            ) from exc
+
+        if self._pipeline is None:
+            device = self._device or self._auto_device()
+            logger.info(
+                "Loading depth model %r from HuggingFace (device=%s)…",
+                self.model_id, device,
+            )
+            kwargs: Dict[str, Any] = {"device": device}
+            if self.cache_dir:
+                kwargs["model_kwargs"] = {"cache_dir": self.cache_dir}
+            self._pipeline = hf_pipeline(
+                task="depth-estimation",
+                model=self.model_id,
+                **kwargs,
+            )
+
+        img = PILImage.open(image_path).convert("RGB")
+        output = self._pipeline(img)
+        depth_img = output["depth"]  # PIL Image (grayscale)
+        depth_arr = np.array(depth_img).astype(np.float32)
+        # Normalise to 0-1
+        dmin, dmax = depth_arr.min(), depth_arr.max()
+        if dmax > dmin:
+            depth_arr = (depth_arr - dmin) / (dmax - dmin)
+        return depth_arr
+
+    def save_depth_map(self, depth: Any, output_path: str) -> str:
+        """Save a normalised depth array as a greyscale PNG for inspection."""
+        try:
+            import numpy as np  # noqa: PLC0415
+            from PIL import Image as PILImage  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError("numpy and Pillow required.") from exc
+
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        img = PILImage.fromarray((depth * 255).astype("uint8"), mode="L")
+        img.save(str(out))
+        logger.info("Depth map saved: %s", out)
+        return str(out)
+
+    def estimate_and_save(self, image_path: str, output_dir: str) -> Tuple[Any, str]:
+        """Estimate depth and save the visualisation.  Returns (depth_array, png_path)."""
+        depth = self.estimate(image_path)
+        stem = Path(image_path).stem
+        png_path = self.save_depth_map(depth, str(Path(output_dir) / f"{stem}_depth.png"))
+        return depth, png_path
+
+    @staticmethod
+    def list_free_models() -> str:
+        """Return a formatted list of the free HuggingFace depth models."""
+        lines = ["Free HuggingFace depth estimation models:"]
+        for name, hf_id in HuggingFaceDepthEstimator.FREE_MODELS.items():
+            lines.append(f"  {name:<28} → hf.co/{hf_id}")
+        lines.append(
+            "\nAll models are free and downloaded from HuggingFace on first use."
+        )
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _auto_device() -> str:
+        try:
+            import torch  # noqa: PLC0415
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            return "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Free open-source image-to-3D backends
+# ---------------------------------------------------------------------------
+
+
+# Registry of every free image-to-3D tool Mossy knows about.
+# All are open-source (GitHub) and/or available on HuggingFace — 100% free.
+FREE_IMAGE_TO_3D_BACKENDS: Dict[str, Dict[str, Any]] = {
+    "triposg": {
+        "name": "TripoSG (VAST-AI-Research)",
+        "description": (
+            "2025 successor to TripoSR — 1.5B rectified-flow transformer. "
+            "Produces sharp, fine-detail GLB meshes from a single image. "
+            "Best free quality/VRAM tradeoff."
+        ),
+        "github": "https://github.com/VAST-AI-Research/TripoSG",
+        "hf_space": "https://huggingface.co/spaces/VAST-AI/TripoSG",
+        "hf_model": "VAST-AI/TripoSG",
+        "license": "MIT",
+        "vram_gb": 8,
+        "output_formats": ["glb"],
+        "install": (
+            "git clone https://github.com/VAST-AI-Research/TripoSG.git\n"
+            "cd TripoSG && pip install -r requirements.txt"
+        ),
+        "run_cmd": "python -m scripts.inference_triposg --image-input IMAGE --output-path OUTPUT.glb",
+    },
+    "trellis": {
+        "name": "Microsoft TRELLIS",
+        "description": (
+            "State-of-the-art unified 3D generation from image or text. "
+            "Outputs textured GLB, PLY and radiance field."
+        ),
+        "github": "https://github.com/microsoft/TRELLIS",
+        "hf_space": "https://huggingface.co/spaces/Microsoft/TRELLIS",
+        "hf_model": "microsoft/TRELLIS-image-large",
+        "license": "MIT",
+        "vram_gb": 16,
+        "output_formats": ["glb", "ply"],
+        "install": (
+            "git clone --recurse-submodules https://github.com/microsoft/TRELLIS.git\n"
+            "cd TRELLIS && . ./setup.sh --new-env --basic --xformers --flash-attn"
+        ),
+        "run_cmd": "python app.py  # Gradio UI",
+    },
+    "triposr": {
+        "name": "TripoSR (Stability AI / VAST-AI)",
+        "description": (
+            "Original fast single-image 3D reconstruction. "
+            "Lightest option at ~6 GB VRAM. Superseded by TripoSG."
+        ),
+        "github": "https://github.com/VAST-AI-Research/TripoSR",
+        "hf_space": "https://huggingface.co/spaces/stabilityai/TripoSR",
+        "hf_model": "stabilityai/TripoSR",
+        "license": "MIT",
+        "vram_gb": 6,
+        "output_formats": ["obj", "glb"],
+        "install": (
+            "git clone https://github.com/VAST-AI-Research/TripoSR.git\n"
+            "cd TripoSR && pip install -r requirements.txt"
+        ),
+        "run_cmd": "python run.py IMAGE --output-dir OUTPUT/",
+    },
+    "instantmesh": {
+        "name": "InstantMesh (TencentARC)",
+        "description": (
+            "Image to high-quality 3D mesh with texture map in seconds. "
+            "Apache 2.0 license."
+        ),
+        "github": "https://github.com/TencentARC/InstantMesh",
+        "hf_space": "https://huggingface.co/spaces/TencentARC/InstantMesh",
+        "hf_model": "TencentARC/InstantMesh",
+        "license": "Apache 2.0",
+        "vram_gb": 12,
+        "output_formats": ["obj"],
+        "install": (
+            "git clone https://github.com/TencentARC/InstantMesh.git\n"
+            "cd InstantMesh && pip install -r requirements.txt"
+        ),
+        "run_cmd": "python run.py configs/instant-mesh-large.yaml IMAGE --export_texmap",
+    },
+    "shap_e": {
+        "name": "Shap-E (OpenAI)",
+        "description": (
+            "Text or image to 3D implicit function → OBJ/PLY via marching cubes. "
+            "Pip-installable, CPU-capable."
+        ),
+        "github": "https://github.com/openai/shap-e",
+        "hf_space": "https://huggingface.co/spaces/hysts/Shap-E",
+        "hf_model": "openai/shap-e-img2img",
+        "license": "MIT",
+        "vram_gb": 8,
+        "output_formats": ["obj", "ply"],
+        "install": (
+            "git clone https://github.com/openai/shap-e.git\n"
+            "cd shap-e && pip install -e ."
+        ),
+        "run_cmd": "# See shap_e/examples/sample_image_to_3d.ipynb",
+    },
+}
+
+
+@dataclass
+class FreeImage3DResult:
+    """Result from a free image-to-3D inference run."""
+    backend: str
+    input_image: str
+    output_dir: str
+    mesh_path: Optional[str] = None
+    exported_files: List[str] = field(default_factory=list)
+    elapsed_s: float = 0.0
+    success: bool = False
+    error: str = ""
+
+    @property
+    def summary(self) -> str:
+        status = "✓" if self.success else "✗"
+        files = ", ".join(Path(f).name for f in self.exported_files) or "none"
+        info = FREE_IMAGE_TO_3D_BACKENDS.get(self.backend, {})
+        lines = [
+            f"{status} {info.get('name', self.backend)}",
+            f"  Input  : {self.input_image}",
+            f"  Output : {files}",
+            f"  Time   : {self.elapsed_s:.1f}s",
+        ]
+        if self.error:
+            lines.append(f"  Error  : {self.error}")
+        return "\n".join(lines)
+
+
+class FreeImage3DClient:
+    """Run free open-source image-to-3D models from GitHub / HuggingFace.
+
+    Meshy (meshy.ai) is a commercial SaaS with no open-source version.
+    These are the best free alternatives — all MIT or Apache-2.0:
+
+    +---------------+--------------------------------+------+----------+
+    | Backend       | Source                         | VRAM | License  |
+    +===============+================================+======+==========+
+    | ``triposg``   | github.com/VAST-AI/TripoSG     |  8GB | MIT ★    |
+    | ``trellis``   | github.com/microsoft/TRELLIS   | 16GB | MIT      |
+    | ``triposr``   | github.com/VAST-AI/TripoSR     |  6GB | MIT      |
+    | ``instantmesh``| github.com/TencentARC          | 12GB | Apache 2 |
+    | ``shap_e``    | github.com/openai/shap-e       |  8GB | MIT      |
+    +---------------+--------------------------------+------+----------+
+    ★ TripoSG is the recommended default — best quality at 8 GB VRAM.
+
+    Each backend is optional — only the one you actually use needs to be
+    cloned and installed.  Call :meth:`list_backends` to see all options
+    and :meth:`install_instructions` for setup steps.
+
+    Parameters
+    ----------
+    repo_root:
+        Directory containing the cloned GitHub repos, organised as
+        sub-folders named after each backend key (``triposg/``,
+        ``trellis/``, ``triposr/``, etc.).
+        Defaults to ``~/AI-Helper/FreeModels``.
+    device:
+        ``"cuda"`` or ``"cpu"``.  Auto-detected when omitted.
+    """
+
+    def __init__(
+        self,
+        repo_root: Optional[str] = None,
+        device: Optional[str] = None,
+    ) -> None:
+        self.repo_root = (
+            Path(repo_root) if repo_root else Path.home() / "AI-Helper" / "FreeModels"
+        )
+        self._device = device
+
+    # ------------------------------------------------------------------
+    # Backend info
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def list_backends() -> str:
+        """Return a formatted table of all free image-to-3D backends."""
+        lines = [
+            "Free image-to-3D backends (open-source — GitHub / HuggingFace):",
+            "",
+            f"  {'Backend':<14} {'Name':<35} {'VRAM':>5}  {'License':<12}  HuggingFace Space",
+            "  " + "-" * 105,
+        ]
+        for key, info in FREE_IMAGE_TO_3D_BACKENDS.items():
+            star = " ★" if key == "triposg" else "  "
+            lines.append(
+                f"  {key:<14} {info['name']:<35} {info['vram_gb']:>4}GB  "
+                f"{info['license']:<12}  {info.get('hf_space', '')}{star}"
+            )
+        lines += [
+            "",
+            "★  TripoSG is the recommended default (8 GB VRAM, MIT, best free quality).",
+            "   Meshy (meshy.ai) is commercial — no open-source version exists on GitHub",
+            "   or HuggingFace.  The Tripo team's open-source work is TripoSG / TripoSR.",
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def install_instructions(backend: str) -> str:
+        """Return step-by-step installation instructions for *backend*."""
+        info = FREE_IMAGE_TO_3D_BACKENDS.get(backend)
+        if not info:
+            valid = ", ".join(FREE_IMAGE_TO_3D_BACKENDS)
+            return f"Unknown backend {backend!r}. Valid options: {valid}"
+        return (
+            f"{info['name']}  [{info['license']} license]\n"
+            f"GitHub  : {info['github']}\n"
+            f"HF Space: {info.get('hf_space', 'N/A')}\n"
+            f"HF Model: {info.get('hf_model', 'N/A')}\n"
+            f"GPU VRAM: {info['vram_gb']} GB minimum\n"
+            f"Output  : {', '.join(info['output_formats'])}\n\n"
+            f"Install:\n{info['install']}\n\n"
+            f"Run:\n{info.get('run_cmd', 'See GitHub README')}"
+        )
+
+    # ------------------------------------------------------------------
+    # TripoSG — recommended free default (8 GB VRAM, MIT, 2025)
+    # ------------------------------------------------------------------
+
+    def run_triposg(
+        self,
+        image_path: str,
+        output_dir: str,
+        faces: Optional[int] = None,
+        seed: int = 42,
+    ) -> FreeImage3DResult:
+        """Run TripoSG to convert a single image to a textured GLB mesh.
+
+        TripoSG is the 2025 successor to TripoSR by VAST-AI-Research.
+        It uses a 1.5 B rectified-flow transformer and produces
+        significantly sharper geometry than TripoSR, at the same
+        8 GB VRAM cost.
+
+        Clone it first:
+
+        .. code-block:: bash
+
+            git clone https://github.com/VAST-AI-Research/TripoSG.git ~/AI-Helper/FreeModels/triposg
+            pip install -r ~/AI-Helper/FreeModels/triposg/requirements.txt
+
+        Model weights are downloaded automatically from HuggingFace
+        (``VAST-AI/TripoSG``) on the first run.
+
+        Parameters
+        ----------
+        image_path:
+            Input photo (PNG or JPEG).  Background is auto-removed.
+        output_dir:
+            Where to save the ``.glb`` output.
+        faces:
+            Optional triangle budget.  Pass e.g. ``5000`` to cap the
+            output mesh at 5 000 triangles (good for Fallout 4 props).
+            When ``None``, the model's default resolution is used.
+        seed:
+            Random seed for reproducible results.
+        """
+        t0 = time.monotonic()
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        result = FreeImage3DResult(
+            backend="triposg",
+            input_image=str(image_path),
+            output_dir=str(out),
+        )
+
+        repo_path = self.repo_root / "triposg"
+        inference_module = repo_path / "scripts" / "inference_triposg.py"
+
+        if not inference_module.exists():
+            result.error = (
+                f"TripoSG not found at {repo_path}.\n"
+                "Clone it with:\n"
+                f"  git clone https://github.com/VAST-AI-Research/TripoSG.git {repo_path}\n"
+                f"  pip install -r {repo_path}/requirements.txt\n"
+                "Weights will download automatically from HuggingFace on first run."
+            )
+            result.elapsed_s = time.monotonic() - t0
+            return result
+
+        import subprocess  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        stem = Path(image_path).stem
+        output_glb = str(out / f"triposg_{stem}.glb")
+
+        cmd = [
+            sys.executable, "-m", "scripts.inference_triposg",
+            "--image-input", str(image_path),
+            "--output-path", output_glb,
+            "--seed", str(seed),
+        ]
+        if faces is not None:
+            cmd.extend(["--faces", str(faces)])
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True, text=True,
+                cwd=str(repo_path),
+                timeout=600,
+            )
+            if proc.returncode != 0:
+                result.error = (proc.stderr or proc.stdout).strip()
+            else:
+                if Path(output_glb).exists():
+                    result.exported_files.append(output_glb)
+                    result.mesh_path = output_glb
+                    result.success = True
+                else:
+                    # Scan for any glb produced
+                    glbs = list(out.rglob("*.glb"))
+                    if glbs:
+                        result.exported_files = [str(p) for p in glbs]
+                        result.mesh_path = str(glbs[0])
+                        result.success = True
+                    else:
+                        result.error = "TripoSG finished but no .glb output found."
+        except subprocess.TimeoutExpired:
+            result.error = "TripoSG timed out after 600 s."
+        except Exception as exc:  # noqa: BLE001
+            result.error = str(exc)
+
+        result.elapsed_s = time.monotonic() - t0
+        return result
+
+    # ------------------------------------------------------------------
+    # TripoSR — lightest free option (6 GB VRAM, original)
+    # ------------------------------------------------------------------
+
+    def run_triposr(
+        self,
+        image_path: str,
+        output_dir: str,
+        chunk_size: int = 8192,
+        mc_resolution: int = 256,
+        no_remove_bg: bool = False,
+        bake_texture: bool = False,
+        texture_resolution: int = 1024,
+    ) -> FreeImage3DResult:
+        """Run TripoSR (original, 6 GB VRAM) to convert an image to OBJ/GLB.
+
+        Clone it first:
+
+        .. code-block:: bash
+
+            git clone https://github.com/VAST-AI-Research/TripoSR.git ~/AI-Helper/FreeModels/triposr
+            pip install -r ~/AI-Helper/FreeModels/triposr/requirements.txt
+
+        Parameters
+        ----------
+        image_path:
+            Input photo (PNG or JPEG).
+        output_dir:
+            Where to save the OBJ/GLB output.
+        chunk_size:
+            Marching-cubes chunk size (lower = less VRAM).
+        mc_resolution:
+            Marching-cubes resolution (higher = more detail).
+        no_remove_bg:
+            Set ``True`` if the image already has a transparent background.
+        bake_texture:
+            When ``True``, bake a texture map instead of vertex colours.
+        texture_resolution:
+            Texture map size in pixels when ``bake_texture=True``.
+        """
+        t0 = time.monotonic()
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        result = FreeImage3DResult(
+            backend="triposr",
+            input_image=str(image_path),
+            output_dir=str(out),
+        )
+
+        repo_path = self.repo_root / "triposr"
+        run_script = repo_path / "run.py"
+
+        if not run_script.exists():
+            result.error = (
+                f"TripoSR not found at {repo_path}.\n"
+                "Clone it with:\n"
+                f"  git clone https://github.com/VAST-AI-Research/TripoSR.git {repo_path}\n"
+                f"  pip install -r {repo_path}/requirements.txt"
+            )
+            result.elapsed_s = time.monotonic() - t0
+            return result
+
+        import subprocess  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        cmd = [
+            sys.executable, str(run_script),
+            str(image_path),
+            "--output-dir", str(out),
+            "--chunk-size", str(chunk_size),
+            "--mc-resolution", str(mc_resolution),
+        ]
+        if no_remove_bg:
+            cmd.append("--no-remove-bg")
+        if bake_texture:
+            cmd.extend(["--bake-texture", "--texture-resolution", str(texture_resolution)])
+
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True,
+                cwd=str(repo_path), timeout=600,
+            )
+            if proc.returncode != 0:
+                result.error = (proc.stderr or proc.stdout).strip()
+            else:
+                for ext in ("obj", "glb", "mtl"):
+                    result.exported_files.extend(str(p) for p in out.rglob(f"*.{ext}"))
+                if result.exported_files:
+                    result.mesh_path = result.exported_files[0]
+                    result.success = True
+                else:
+                    result.error = "TripoSR completed but no output files found."
+        except subprocess.TimeoutExpired:
+            result.error = "TripoSR timed out after 600 s."
+        except Exception as exc:  # noqa: BLE001
+            result.error = str(exc)
+
+        result.elapsed_s = time.monotonic() - t0
+        return result
+
+    # ------------------------------------------------------------------
+    # TRELLIS — highest quality (16 GB VRAM)
+    # ------------------------------------------------------------------
+
+    def run_trellis(
+        self,
+        image_path: str,
+        output_dir: str,
+        simplify: float = 0.95,
+        texture_size: int = 1024,
+        seed: int = 1,
+    ) -> FreeImage3DResult:
+        """Run Microsoft TRELLIS to convert an image to a textured GLB.
+
+        Clone and set up TRELLIS first:
+
+        .. code-block:: bash
+
+            git clone --recurse-submodules https://github.com/microsoft/TRELLIS.git ~/AI-Helper/FreeModels/trellis
+            cd ~/AI-Helper/FreeModels/trellis
+            . ./setup.sh --new-env --basic --xformers --flash-attn
+
+        Requires 16 GB+ GPU VRAM.
+
+        Parameters
+        ----------
+        image_path:
+            Input photo (PNG or JPEG).
+        output_dir:
+            Where to save GLB and PLY outputs.
+        simplify:
+            Mesh simplification ratio (0.95 = keep 95% of polygons).
+        texture_size:
+            Texture resolution in pixels.
+        seed:
+            Random seed for reproducibility.
+        """
+        t0 = time.monotonic()
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        result = FreeImage3DResult(
+            backend="trellis",
+            input_image=str(image_path),
+            output_dir=str(out),
+        )
+
+        repo_path = self.repo_root / "trellis"
+        if not (repo_path / "trellis").exists():
+            result.error = (
+                f"TRELLIS not found at {repo_path}.\n"
+                "Set it up with:\n"
+                f"  git clone --recurse-submodules https://github.com/microsoft/TRELLIS.git {repo_path}\n"
+                f"  cd {repo_path} && . ./setup.sh --new-env --basic --xformers --flash-attn\n"
+                "Requires 16 GB+ GPU VRAM."
+            )
+            result.elapsed_s = time.monotonic() - t0
+            return result
+
+        try:
+            import sys  # noqa: PLC0415
+            import os as _os  # noqa: PLC0415
+            sys.path.insert(0, str(repo_path))
+            _os.environ.setdefault("SPCONV_ALGO", "native")
+            from PIL import Image as PILImage  # noqa: PLC0415
+            from trellis.pipelines import TrellisImageTo3DPipeline  # noqa: PLC0415
+            from trellis.utils import postprocessing_utils  # noqa: PLC0415
+
+            logger.info("Loading TRELLIS pipeline (microsoft/TRELLIS-image-large)…")
+            pipeline = TrellisImageTo3DPipeline.from_pretrained(
+                "microsoft/TRELLIS-image-large"
+            )
+            pipeline.cuda()
+
+            image = PILImage.open(image_path).convert("RGB")
+            outputs = pipeline.run(image, seed=seed)
+
+            stem = Path(image_path).stem
+            glb = postprocessing_utils.to_glb(
+                outputs["gaussian"][0],
+                outputs["mesh"][0],
+                simplify=simplify,
+                texture_size=texture_size,
+            )
+            glb_path = str(out / f"trellis_{stem}.glb")
+            glb.export(glb_path)
+            result.exported_files.append(glb_path)
+
+            ply_path = str(out / f"trellis_{stem}.ply")
+            outputs["gaussian"][0].save_ply(ply_path)
+            result.exported_files.append(ply_path)
+
+            result.mesh_path = glb_path
+            result.success = True
+
+        except ImportError as exc:
+            result.error = (
+                f"TRELLIS import failed: {exc}\n"
+                "Make sure you ran setup.sh and are in the TRELLIS conda environment."
+            )
+        except Exception as exc:  # noqa: BLE001
+            result.error = str(exc)
+            logger.exception("TRELLIS inference failed")
+
+        result.elapsed_s = time.monotonic() - t0
+        return result
+
+    # ------------------------------------------------------------------
+    # Shap-E — pip-installable, CPU-capable fallback
+    # ------------------------------------------------------------------
+
+    def run_shap_e(
+        self,
+        image_path: str,
+        output_dir: str,
+        guidance_scale: float = 3.0,
+        karras_steps: int = 64,
+    ) -> FreeImage3DResult:
+        """Run OpenAI Shap-E to generate a 3D mesh from an image.
+
+        Shap-E is pip-installable and can run on CPU (slower):
+
+        .. code-block:: bash
+
+            git clone https://github.com/openai/shap-e.git ~/AI-Helper/FreeModels/shap_e
+            pip install -e ~/AI-Helper/FreeModels/shap_e
+
+        Parameters
+        ----------
+        image_path:
+            Input photo.
+        output_dir:
+            Where to write the OBJ output.
+        guidance_scale:
+            How closely to match the input image (higher = closer).
+        karras_steps:
+            Diffusion noise schedule steps (higher = better quality, slower).
+        """
+        t0 = time.monotonic()
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        result = FreeImage3DResult(
+            backend="shap_e",
+            input_image=str(image_path),
+            output_dir=str(out),
+        )
+
+        repo_path = self.repo_root / "shap_e"
+        if (repo_path / "shap_e").exists():
+            import sys  # noqa: PLC0415
+            sys.path.insert(0, str(repo_path))
+
+        try:
+            import torch  # noqa: PLC0415
+            from PIL import Image as PILImage  # noqa: PLC0415
+            from shap_e.diffusion.sample import sample_latents  # noqa: PLC0415
+            from shap_e.diffusion.gaussian_diffusion import diffusion_from_config  # noqa: PLC0415
+            from shap_e.models.download import load_model, load_config  # noqa: PLC0415
+            from shap_e.util.notebooks import decode_latent_mesh  # noqa: PLC0415
+        except ImportError as exc:
+            result.error = (
+                f"Shap-E import failed: {exc}\n"
+                "Clone and install with:\n"
+                f"  git clone https://github.com/openai/shap-e.git {repo_path}\n"
+                f"  pip install -e {repo_path}"
+            )
+            result.elapsed_s = time.monotonic() - t0
+            return result
+
+        try:
+            device = torch.device(
+                self._device or ("cuda" if torch.cuda.is_available() else "cpu")
+            )
+            xm = load_model("transmitter", device=device)
+            model = load_model("image300M", device=device)
+            diffusion = diffusion_from_config(load_config("diffusion"))
+
+            img = PILImage.open(image_path).convert("RGB")
+            latents = sample_latents(
+                batch_size=1,
+                model=model,
+                diffusion=diffusion,
+                guidance_scale=guidance_scale,
+                model_kwargs=dict(images=[img]),
+                progress=True,
+                clip_denoised=True,
+                use_fp16=True,
+                use_karras=True,
+                karras_steps=karras_steps,
+                sigma_min=1e-3,
+                sigma_max=160,
+                s_churn=0,
+            )
+            obj_path = str(out / f"shap_e_{Path(image_path).stem}.obj")
+            t_mesh = decode_latent_mesh(xm, latents[0]).tri_mesh()
+            with open(obj_path, "w", encoding="utf-8") as fh:
+                t_mesh.write_obj(fh)
+            result.exported_files.append(obj_path)
+            result.mesh_path = obj_path
+            result.success = True
+
+        except Exception as exc:  # noqa: BLE001
+            result.error = str(exc)
+            logger.exception("Shap-E inference failed")
+
+        result.elapsed_s = time.monotonic() - t0
+        return result
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _auto_device() -> str:
+        try:
+            import torch  # noqa: PLC0415
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            return "cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -147,27 +1222,56 @@ _FO4_KNOWLEDGE: Dict[str, Any] = {
     },
     "workflow_steps": [
         "1. Capture photos from multiple angles (min 20-30, overlap ≥60%)",
-        "2. Run photogrammetry software (Meshroom, Reality Capture, or COLMAP)",
-        "3. Clean mesh in Blender: remove floating geometry, fill holes, retopo if needed",
-        "4. UV unwrap and bake high-poly → low-poly textures",
-        "5. Export textures as DDS (BC1/BC3/BC5) using GIMP DDS plugin or Texconv",
-        "6. Import mesh into Blender with NifTools add-on, assign BSLightingShaderProperty",
+        "2. Option A — Free AI (recommended): TripoSG (github.com/VAST-AI-Research/TripoSG, MIT, 8GB VRAM) — single image → GLB",
+        "2. Option B — Paid AI (subscription): Meshy (meshy.ai) — upload image → download OBJ/GLB",
+        "2. Option C — Free photogrammetry: Meshroom (free, GitHub) or COLMAP (free, GitHub/CLI)",
+        "2. Option D — Free depth AI: Depth-Anything v2 (free, HuggingFace) for single-image depth maps",
+        "3. Clean mesh in Blender (free): remove floating geometry, fill holes, retopo if needed",
+        "4. UV unwrap and bake high-poly → low-poly textures in Blender",
+        "5. Export textures as DDS using GIMP (free) + DDS plugin OR Texconv (free, Microsoft CLI)",
+        "6. Import mesh into Blender with NifTools add-on (free, GitHub), assign BSLightingShaderProperty",
         "7. Set BSXFlags for collision/animation requirements",
         "8. Add collision mesh (bhkConvexVerticesShape for simple objects)",
         "9. Export as NIF via NifTools Blender add-on (File → Export → NetImmerse/Gamebryo)",
-        "10. Test in Creation Kit — add to FormList, place in world, verify scale and collision",
+        "10. Test in Creation Kit (free, Bethesda Launcher) — place in world, verify scale and collision",
     ],
     "recommended_tools": {
-        "photogrammetry": ["Meshroom (free, GPU)", "COLMAP (free, CLI)", "Reality Capture (paid)"],
-        "mesh_editing": ["Blender 3.x/4.x (free) with NifTools add-on", "3ds Max (paid)"],
-        "nif_editing": ["NifSkope 2.0 (free, NIF viewer/editor)", "NifTools Blender add-on"],
-        "texture_tools": [
-            "GIMP + DDS plugin",
-            "Texconv (Microsoft, CLI)",
-            "Substance Painter (paid, best quality)",
-            "Paint.NET + DDS plugin",
+        "ai_image_to_3d": [
+            "Meshy (meshy.ai — user has paid subscription; best quality, fast)",
+            "TripoSR (free, HuggingFace: stabilityai/TripoSR — single image to 3D)",
+            "Zero123++ (free, HuggingFace: sudo-ai/zero123plus — multi-view from single image)",
         ],
-        "testing": ["Creation Kit (free, from Bethesda Launcher)", "xEdit / FO4Edit"],
+        "photogrammetry_free": [
+            "Meshroom (free, GitHub: alicevision/Meshroom — GPU-accelerated, best quality)",
+            "COLMAP (free, GitHub: colmap/colmap — CLI, highly configurable)",
+            "OpenMVG + OpenMVS (free, GitHub — lightweight pipeline)",
+        ],
+        "depth_estimation_free": [
+            "Depth-Anything v2 (free, HuggingFace: depth-anything/Depth-Anything-V2)",
+            "MiDaS (free, HuggingFace: Intel/dpt-large)",
+            "ZoeDepth (free, HuggingFace: isl-org/ZoeDepth)",
+        ],
+        "mesh_editing_free": [
+            "Blender 3.x/4.x (free, blender.org) with NifTools add-on",
+            "MeshLab (free, GitHub: cnr-isti-vclab/meshlab — mesh cleaning/decimation)",
+            "Instant Meshes (free, GitHub: wjakob/instant-meshes — auto retopo)",
+        ],
+        "nif_tools_free": [
+            "NifSkope 2.0 (free, GitHub: niftools/nifskope — NIF viewer and editor)",
+            "NifTools Blender add-on (free, GitHub: niftools/blender_niftools_addon)",
+            "pyffi (free, GitHub: niftools/pyffi — Python NIF I/O library)",
+        ],
+        "texture_tools_free": [
+            "GIMP (free) + DDS plugin (GitHub: FrancescoR/gimp-dds)",
+            "Texconv (free, GitHub: Microsoft/DirectXTex — CLI batch DDS conversion)",
+            "Paint.NET (free, getpaint.net) + DDS plugin",
+            "Krita (free, krita.org) + DDS export",
+        ],
+        "testing_free": [
+            "Creation Kit (free, Bethesda Launcher)",
+            "xEdit / FO4Edit (free, GitHub: TES5Edit/TES5Edit)",
+            "LODGen / xLODGen (free, GitHub)",
+        ],
     },
     "common_errors": {
         "black_mesh": "Missing or wrong diffuse texture path; check NIF texture slot",
@@ -204,7 +1308,8 @@ _KNOWLEDGE_KEYWORDS: List[Tuple[List[str], str]] = [
     (["workflow", "steps", "how to", "process", "pipeline", "convert", "export"],
      "workflow_steps"),
     (["tool", "software", "meshroom", "colmap", "blender", "nifskope", "creation kit",
-      "texconv", "substance"],
+      "texconv", "triposg", "triposr", "trellis", "instantmesh", "shap-e", "free",
+      "open source", "github", "huggingface"],
      "recommended_tools"),
     (["error", "bug", "problem", "black", "purple", "invisible", "wrong scale", "t-pose",
       "no collision", "falling"],
@@ -1045,8 +2150,15 @@ class MeshValidator:
 class MeshEngine:
     """Unified façade for Mossy's 3-D mesh capabilities.
 
-    Combines image scanning, mesh conversion, Fallout 4 domain knowledge
-    and mesh validation into a single entry point.
+    Combines image scanning, free AI image-to-3D models (TripoSG, TRELLIS,
+    TripoSR, Shap-E), paid Meshy API (user subscription), HuggingFace depth
+    estimation, mesh conversion, Fallout 4 domain knowledge and validation.
+
+    Free-first philosophy
+    ~~~~~~~~~~~~~~~~~~~~~
+    All backends except Meshy are free and open-source (GitHub / HuggingFace).
+    TripoSG is the **recommended default** for image-to-3D: MIT license,
+    8 GB VRAM, best free quality.
 
     Parameters
     ----------
@@ -1058,6 +2170,12 @@ class MeshEngine:
         Scale factor applied on export (default: 70 units/metre for FO4).
     output_root:
         Default directory for scan outputs.
+    free_models_root:
+        Directory containing cloned free model repos (TripoSG, TRELLIS, etc.).
+        Defaults to ``~/AI-Helper/FreeModels``.
+    meshy_api_key:
+        Meshy API key for the paid image-to-3D service.  Falls back to the
+        ``MESHY_API_KEY`` environment variable when not supplied.
     """
 
     def __init__(
@@ -1066,6 +2184,8 @@ class MeshEngine:
         mesh_depth: int = 9,
         game_scale: float = FalloutMeshExporter.GAME_UNITS_PER_METRE,
         output_root: Optional[str] = None,
+        free_models_root: Optional[str] = None,
+        meshy_api_key: Optional[str] = None,
     ) -> None:
         self.knowledge = Fallout4MeshKnowledge()
         self.scanner = ImageMeshScanner(
@@ -1074,6 +2194,9 @@ class MeshEngine:
         )
         self.exporter = FalloutMeshExporter(game_scale=game_scale)
         self.validator = MeshValidator(self.knowledge)
+        self.free_client = FreeImage3DClient(repo_root=free_models_root)
+        self.meshy = MeshyClient(api_key=meshy_api_key)
+        self.depth_estimator = HuggingFaceDepthEstimator()
         self.output_root = Path(output_root) if output_root else Path.cwd() / "mesh_output"
 
     # ------------------------------------------------------------------
@@ -1089,8 +2212,187 @@ class MeshEngine:
         steps = self.knowledge.get_workflow()
         return "Recommended Image → Fallout 4 Mesh Workflow:\n" + "\n".join(steps)
 
+    def list_free_tools(self) -> str:
+        """Return a table of all free image-to-3D backends Mossy knows about."""
+        return FreeImage3DClient.list_backends()
+
+    def install_instructions(self, backend: str) -> str:
+        """Return step-by-step install instructions for a free backend.
+
+        Valid backend names: ``triposg``, ``trellis``, ``triposr``,
+        ``instantmesh``, ``shap_e``.
+        """
+        return FreeImage3DClient.install_instructions(backend)
+
     # ------------------------------------------------------------------
-    # Scanning
+    # Free AI image-to-3D (TripoSG recommended)
+    # ------------------------------------------------------------------
+
+    def free_image_to_3d(
+        self,
+        image_path: str,
+        output_dir: Optional[str] = None,
+        backend: str = "triposg",
+        **kwargs: Any,
+    ) -> FreeImage3DResult:
+        """Convert a single image to a 3D mesh using a free open-source model.
+
+        Parameters
+        ----------
+        image_path:
+            Input photograph (PNG or JPEG).
+        output_dir:
+            Where to save the output mesh.  Defaults to
+            ``output_root/free_<backend>_<timestamp>``.
+        backend:
+            Which free model to use.  Options:
+
+            * ``"triposg"`` *(default)* — TripoSG, 8 GB VRAM, MIT,
+              best free quality (github.com/VAST-AI-Research/TripoSG)
+            * ``"trellis"`` — Microsoft TRELLIS, 16 GB VRAM, MIT
+              (github.com/microsoft/TRELLIS)
+            * ``"triposr"`` — TripoSR original, 6 GB VRAM, MIT
+              (github.com/VAST-AI-Research/TripoSR)
+            * ``"shap_e"`` — OpenAI Shap-E, CPU-capable, MIT
+              (github.com/openai/shap-e)
+        **kwargs:
+            Additional arguments forwarded to the backend's ``run_*`` method.
+            See :class:`FreeImage3DClient` for per-backend options.
+        """
+        out_dir = output_dir or str(
+            self.output_root / f"free_{backend}_{time.strftime('%Y%m%d_%H%M%S')}"
+        )
+        dispatch = {
+            "triposg": self.free_client.run_triposg,
+            "trellis": self.free_client.run_trellis,
+            "triposr": self.free_client.run_triposr,
+            "shap_e": self.free_client.run_shap_e,
+        }
+        runner = dispatch.get(backend)
+        if runner is None:
+            valid = ", ".join(dispatch)
+            return FreeImage3DResult(
+                backend=backend,
+                input_image=str(image_path),
+                output_dir=str(out_dir),
+                error=f"Unknown backend {backend!r}. Valid: {valid}",
+            )
+        return runner(image_path, out_dir, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Meshy (paid subscription)
+    # ------------------------------------------------------------------
+
+    def meshy_image_to_3d(
+        self,
+        image_path: str,
+        output_dir: Optional[str] = None,
+        api_key: Optional[str] = None,
+        download_fmt: str = "obj",
+        target_polycount: int = 10000,
+        enable_pbr: bool = True,
+    ) -> ScanResult:
+        """Convert an image to a 3D mesh using the Meshy API (paid subscription).
+
+        Parameters
+        ----------
+        image_path:
+            Input photograph (PNG or JPEG).
+        output_dir:
+            Where to save the downloaded mesh.
+        api_key:
+            Meshy API key.  Falls back to ``MESHY_API_KEY`` env var.
+        download_fmt:
+            Mesh format to download: ``"obj"``, ``"glb"``, ``"fbx"``, ``"usdz"``.
+        target_polycount:
+            Polygon budget hint passed to Meshy (default 10 000).
+        enable_pbr:
+            When ``True``, Meshy generates PBR texture maps.
+        """
+        t0 = time.monotonic()
+        out_dir = Path(output_dir) if output_dir else (
+            self.output_root / f"meshy_{time.strftime('%Y%m%d_%H%M%S')}"
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        result = ScanResult(
+            input_images=[str(image_path)],
+            output_dir=str(out_dir),
+            mesh_path=None,
+            point_cloud_path=None,
+        )
+
+        if api_key:
+            self.meshy.api_key = api_key
+
+        try:
+            task = self.meshy.image_to_3d(
+                image_path=str(image_path),
+                enable_pbr=enable_pbr,
+                target_polycount=target_polycount,
+            )
+        except (ValueError, RuntimeError) as exc:
+            result.errors.append(str(exc))
+            result.elapsed_s = time.monotonic() - t0
+            return result
+
+        if not task.succeeded:
+            result.errors.append(
+                f"Meshy task {task.task_id} failed: {task.error or task.status}"
+            )
+            result.elapsed_s = time.monotonic() - t0
+            return result
+
+        # Download mesh
+        mesh_path = self.meshy.download_result(task, str(out_dir), fmt=download_fmt)
+        if mesh_path:
+            result.exported_files.append(mesh_path)
+            result.mesh_path = mesh_path
+
+        # Download textures
+        textures = self.meshy.download_textures(task, str(out_dir))
+        result.exported_files.extend(textures)
+
+        result.success = bool(mesh_path)
+        result.elapsed_s = time.monotonic() - t0
+        return result
+
+    # ------------------------------------------------------------------
+    # HuggingFace depth estimation (free)
+    # ------------------------------------------------------------------
+
+    def estimate_depth(
+        self,
+        image_path: str,
+        output_dir: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ) -> str:
+        """Estimate monocular depth for *image_path* using a free HF model.
+
+        Downloads ``depth-anything/Depth-Anything-V2-Small-hf`` on first use
+        (free, HuggingFace).  Returns a text summary and saves a depth PNG.
+        """
+        out_dir = output_dir or str(
+            self.output_root / f"depth_{time.strftime('%Y%m%d_%H%M%S')}"
+        )
+        if model_id:
+            self.depth_estimator.model_id = model_id
+        try:
+            depth, png_path = self.depth_estimator.estimate_and_save(image_path, out_dir)
+            return (
+                f"Depth estimation complete.\n"
+                f"  Model  : {self.depth_estimator.model_id}\n"
+                f"  Input  : {image_path}\n"
+                f"  Output : {png_path}\n"
+                f"  Range  : 0.0 – 1.0 (normalised)"
+            )
+        except ImportError as exc:
+            return f"Depth estimation unavailable: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            return f"Depth estimation failed: {exc}"
+
+    # ------------------------------------------------------------------
+    # Classic multi-image scan (open3d/opencv pipeline)
     # ------------------------------------------------------------------
 
     def scan_images(
@@ -1101,19 +2403,25 @@ class MeshEngine:
         asset_type: str = "settlement_object_medium",
         mesh_name: str = "fo4_mesh",
     ) -> ScanResult:
-        """Full pipeline: images → point cloud → mesh → export.
+        """Multi-image scan pipeline: images → point cloud → mesh → export.
+
+        Uses OpenCV for feature extraction and Open3D for Poisson mesh
+        reconstruction.  All dependencies are free and open-source.
+
+        For better quality from a single image, use :meth:`free_image_to_3d`
+        (TripoSG) or :meth:`meshy_image_to_3d` (Meshy subscription) instead.
 
         Parameters
         ----------
         image_paths:
             List of photograph paths (JPEG, PNG, etc.).
         output_dir:
-            Where to write output files.  Defaults to ``output_root/<timestamp>``.
+            Where to write output files.
         export_formats:
-            List of formats to export.  Supported: ``"obj"``, ``"ply"``,
-            ``"nif"`` (requires pyffi).  Defaults to ``["obj", "ply"]``.
+            Formats to export: ``"obj"``, ``"ply"``, ``"nif"``.
+            Defaults to ``["obj", "ply"]``.
         asset_type:
-            FO4 asset category for validation.
+            FO4 asset category for polygon budget validation.
         mesh_name:
             Name embedded in exported files.
         """
@@ -1133,17 +2441,16 @@ class MeshEngine:
             point_cloud_path=str(out_dir / "point_cloud.ply"),
         )
 
-        # Check dependencies
+        # Dependency check
         deps = self.scanner.check_dependencies()
         missing = [pkg for pkg, ok in deps.items() if not ok]
         if missing:
             result.warnings.append(
                 f"Optional packages not installed: {', '.join(missing)}. "
-                "Install them for full 3D reconstruction: "
-                f"pip install {' '.join(missing)}"
+                f"Install: pip install {' '.join(missing)}"
             )
 
-        # Validate image files exist
+        # Validate image files
         valid_images = []
         for p in image_paths:
             if Path(p).exists():
@@ -1154,9 +2461,10 @@ class MeshEngine:
         if not valid_images:
             result.errors.append("No valid input images found.")
             result.elapsed_s = time.monotonic() - t0
+            self._write_scan_metadata(result, out_dir, asset_type, t0)
             return result
 
-        # --- Point cloud ---
+        # Point cloud
         pcd = None
         try:
             pcd, result.point_count = self.scanner.images_to_point_cloud(
@@ -1170,7 +2478,7 @@ class MeshEngine:
             result.errors.append(f"Point cloud failed: {exc}")
             logger.exception("Point cloud reconstruction failed")
 
-        # --- Mesh ---
+        # Mesh generation
         mesh = None
         if pcd is not None:
             try:
@@ -1185,7 +2493,7 @@ class MeshEngine:
                 result.errors.append(f"Mesh generation failed: {exc}")
                 logger.exception("Mesh generation failed")
 
-        # --- Export ---
+        # Export
         if mesh is not None:
             for fmt in export_formats:
                 fmt_lower = fmt.lower()
@@ -1213,29 +2521,36 @@ class MeshEngine:
                     result.errors.append(f"Export {fmt} failed: {exc}")
                     logger.exception("Export failed for format %s", fmt)
 
-            # Validate polygon budget
             budget_issues = self.knowledge.validate_mesh_metadata(
                 result.poly_count, asset_type
             )
             result.warnings.extend(budget_issues)
 
-        # Write scan metadata JSON
-        meta_path = out_dir / "scan_metadata.json"
-        meta = {
-            "input_images": result.input_images,
-            "point_count": result.point_count,
-            "poly_count": result.poly_count,
-            "exported_files": result.exported_files,
-            "asset_type": asset_type,
-            "elapsed_s": round(time.monotonic() - t0, 2),
-            "warnings": result.warnings,
-            "errors": result.errors,
-        }
-        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
+        self._write_scan_metadata(result, out_dir, asset_type, t0)
         result.success = not result.errors and (mesh is not None or bool(result.warnings))
         result.elapsed_s = time.monotonic() - t0
         return result
+
+    @staticmethod
+    def _write_scan_metadata(
+        result: ScanResult, out_dir: Path, asset_type: str, t0: float
+    ) -> None:
+        """Write scan_metadata.json into *out_dir*."""
+        try:
+            meta_path = out_dir / "scan_metadata.json"
+            meta = {
+                "input_images": result.input_images,
+                "point_count": result.point_count,
+                "poly_count": result.poly_count,
+                "exported_files": result.exported_files,
+                "asset_type": asset_type,
+                "elapsed_s": round(time.monotonic() - t0, 2),
+                "warnings": result.warnings,
+                "errors": result.errors,
+            }
+            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Could not write scan metadata: %s", exc)
 
     # ------------------------------------------------------------------
     # Validation
@@ -1252,14 +2567,15 @@ class MeshEngine:
     # ------------------------------------------------------------------
 
     def extract_image_features(self, image_path: str) -> str:
-        """Return a text report of features extracted from *image_path*."""
+        """Return a text report of keypoint features from *image_path*."""
         try:
             features = self.scanner.extract_features(image_path)
             return (
                 f"Image features for {Path(image_path).name}:\n"
                 f"  Dimensions   : {features.width}×{features.height}\n"
                 f"  Keypoints    : {features.keypoint_count:,}\n"
-                f"  Descriptor   : {features.descriptors_shape[1]}-dim × {features.descriptors_shape[0]} kp"
+                f"  Descriptor   : {features.descriptors_shape[1]}-dim × "
+                f"{features.descriptors_shape[0]} kp"
             )
         except ImportError as exc:
             return f"Feature extraction unavailable: {exc}"
@@ -1267,10 +2583,19 @@ class MeshEngine:
             return f"Feature extraction failed: {exc}"
 
     def check_dependencies(self) -> str:
-        """Return a formatted dependency status report."""
+        """Return a formatted dependency status report for all mesh packages."""
         deps = self.scanner.check_dependencies()
         lines = ["Mesh Engine dependency status:"]
         for pkg, ok in deps.items():
-            status = "✓ installed" if ok else "✗ missing — pip install " + pkg
+            status = "✓ installed" if ok else f"✗ missing  →  pip install {pkg}"
             lines.append(f"  {pkg:<20} {status}")
+        lines += [
+            "",
+            "Free image-to-3D models (clone from GitHub, no pip install needed):",
+        ]
+        for key, info in FREE_IMAGE_TO_3D_BACKENDS.items():
+            repo_dir = self.free_client.repo_root / key
+            installed = "✓ found" if repo_dir.exists() else f"✗ not found  →  git clone {info['github']}"
+            lines.append(f"  {key:<14} {installed}")
         return "\n".join(lines)
+
