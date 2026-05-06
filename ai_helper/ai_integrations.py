@@ -63,13 +63,9 @@ _DEFAULT_TIMEOUT = 3.0   # seconds for HTTP health checks
 _BREAKERS: Dict[str, CircuitBreaker] = {
     name: CircuitBreaker(name=name, failure_threshold=3, recovery_timeout=20.0)
     for name in ("ollama", "lmstudio", "comfyui", "sdwebui", "openwebui",
-                 "localai", "textgen", "oobabooga", "jan", "llamacpp")
+                 "localai", "textgen", "oobabooga", "jan", "llamacpp",
+                 "koboldcpp", "tabbyapi", "gpt4all", "aphrodite")
 }
-
-
-# ---------------------------------------------------------------------------
-# Data types
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -331,16 +327,24 @@ class OllamaClient:
 
 # Known AI programs: (name, health-check URL, optional version path)
 _KNOWN_APPS: List[tuple[str, str, Optional[str]]] = [
-    ("Ollama",               "http://localhost:11434/api/tags",   "http://localhost:11434/api/version"),
-    ("LM Studio",            "http://localhost:1234/v1/models",   None),
-    ("ComfyUI",              "http://localhost:8188/system_stats", None),
-    ("Stable Diffusion WebUI", "http://localhost:7860/sdapi/v1/options", None),
-    ("Open WebUI",           "http://localhost:3000",             None),
-    ("LocalAI",              "http://localhost:8080/v1/models",   None),
-    ("text-generation-webui","http://localhost:7861/api/v1/model", None),
-    ("Oobabooga API",        "http://localhost:5000/api/v1/model", None),
-    ("Jan",                  "http://localhost:1337/v1/models",   None),
-    ("LLaMA.cpp server",     "http://localhost:8000/health",      None),
+    ("Ollama",               "http://localhost:11434/api/tags",    "http://localhost:11434/api/version"),
+    ("LM Studio",            "http://localhost:1234/v1/models",    None),
+    ("ComfyUI",              "http://localhost:8188/system_stats",  None),
+    ("Stable Diffusion WebUI","http://localhost:7860/sdapi/v1/options", None),
+    ("Open WebUI",           "http://localhost:3000",               None),
+    ("LocalAI",              "http://localhost:8080/v1/models",     None),
+    ("text-generation-webui","http://localhost:7861/api/v1/model",  None),
+    ("Oobabooga API",        "http://localhost:5000/api/v1/model",  None),
+    ("Jan",                  "http://localhost:1337/v1/models",     None),
+    ("LLaMA.cpp server",     "http://localhost:8000/health",        None),
+    # Additional free local AI servers
+    ("KoboldCpp",            "http://localhost:5001/api/v1/model",  None),
+    ("TabbyAPI",             "http://localhost:5000/v1/models",     None),
+    ("GPT4All",              "http://localhost:4891/v1/models",     None),
+    ("Aphrodite Engine",     "http://localhost:2242/v1/models",     None),
+    ("vLLM",                 "http://localhost:8001/v1/models",     None),
+    ("AnythingLLM",          "http://localhost:3001/api/ping",      None),
+    ("SillyTavern",          "http://localhost:8000/api/ping",      None),
 ]
 
 
@@ -695,3 +699,295 @@ class SDWebUIClient:
         """Return available sampler names."""
         data = _get(f"{self.base_url}/sdapi/v1/samplers") or []
         return [s.get("name", "") for s in data]
+
+
+# ---------------------------------------------------------------------------
+# KoboldCpp client (free, llama.cpp-based, single-binary)
+# ---------------------------------------------------------------------------
+
+
+class KoboldCppClient:
+    """Interact with a KoboldCpp server (free, https://github.com/LostRuins/koboldcpp).
+
+    KoboldCpp is a single-executable GGUF/GGML inference server with a
+    built-in UI.  It supports any GGUF model (LLaMA, Mistral, Gemma, etc.)
+    and runs on CPU or GPU.
+
+    Default port: ``5001``.
+    """
+
+    def __init__(self, base_url: str = "http://localhost:5001") -> None:
+        self.base_url = base_url.rstrip("/")
+
+    def is_running(self) -> bool:
+        return _reachable(f"{self.base_url}/api/v1/model")
+
+    def status(self) -> AIAppStatus:
+        return AIAppStatus(name="KoboldCpp", url=self.base_url, running=self.is_running())
+
+    def get_model(self) -> str:
+        """Return the name of the currently loaded model."""
+        data = _get(f"{self.base_url}/api/v1/model") or {}
+        return data.get("result", "")
+
+    def generate(
+        self,
+        prompt: str,
+        max_length: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        stop_sequences: Optional[List[str]] = None,
+        timeout: float = 120.0,
+    ) -> GenerateResult:
+        """Generate a completion using KoboldCpp's native API.
+
+        Parameters
+        ----------
+        prompt:
+            Input text prompt.
+        max_length:
+            Maximum new tokens to generate.
+        temperature:
+            Sampling temperature.
+        top_p:
+            Nucleus sampling parameter.
+        stop_sequences:
+            Optional list of strings that stop generation.
+        timeout:
+            Request timeout in seconds.
+        """
+        payload: Dict[str, Any] = {
+            "prompt": prompt,
+            "max_length": max_length,
+            "temperature": temperature,
+            "top_p": top_p,
+        }
+        if stop_sequences:
+            payload["stop_sequence"] = stop_sequences
+
+        result = _post(f"{self.base_url}/api/v1/generate", payload, timeout=timeout)
+        if not result:
+            return GenerateResult(model="koboldcpp", prompt=prompt, response="",
+                                  done=False, error="KoboldCpp returned no response.")
+        results_list = result.get("results", [{}])
+        text = results_list[0].get("text", "") if results_list else ""
+        return GenerateResult(model="koboldcpp", prompt=prompt, response=text, done=True)
+
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        max_length: int = 512,
+        temperature: float = 0.7,
+        timeout: float = 120.0,
+    ) -> GenerateResult:
+        """OpenAI-compatible chat completion via KoboldCpp's /v1/chat endpoint."""
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": max_length,
+            "temperature": temperature,
+        }
+        result = _post(f"{self.base_url}/v1/chat/completions", payload, timeout=timeout)
+        if not result:
+            return GenerateResult(model="koboldcpp", prompt="", response="",
+                                  done=False, error="KoboldCpp chat returned no response.")
+        choice = (result.get("choices") or [{}])[0]
+        text = choice.get("message", {}).get("content", "")
+        return GenerateResult(model="koboldcpp", prompt="", response=text, done=True)
+
+
+# ---------------------------------------------------------------------------
+# TabbyAPI client (free, exllamav2-based, OpenAI-compatible)
+# ---------------------------------------------------------------------------
+
+
+class TabbyAPIClient:
+    """Interact with a TabbyAPI server (free, https://github.com/theroyallab/tabbyAPI).
+
+    TabbyAPI uses ExLlamaV2 for fast GPTQ/EXL2 inference and exposes an
+    OpenAI-compatible API.  Excellent throughput for quantised models.
+
+    Default port: ``5000``.
+    """
+
+    def __init__(self, base_url: str = "http://localhost:5000") -> None:
+        self.base_url = base_url.rstrip("/")
+
+    def is_running(self) -> bool:
+        return _reachable(f"{self.base_url}/v1/models")
+
+    def status(self) -> AIAppStatus:
+        return AIAppStatus(name="TabbyAPI", url=self.base_url, running=self.is_running())
+
+    def list_models(self) -> List[str]:
+        """Return model names available in TabbyAPI."""
+        data = _get(f"{self.base_url}/v1/models") or {}
+        return [m.get("id", "") for m in data.get("data", [])]
+
+    def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        timeout: float = 120.0,
+    ) -> GenerateResult:
+        """Generate a completion via TabbyAPI's /v1/completions endpoint."""
+        payload: Dict[str, Any] = {
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+        }
+        result = _post(f"{self.base_url}/v1/completions", payload, timeout=timeout)
+        if not result:
+            return GenerateResult(model="tabbyapi", prompt=prompt, response="",
+                                  done=False, error="TabbyAPI returned no response.")
+        choice = (result.get("choices") or [{}])[0]
+        text = choice.get("text", "")
+        return GenerateResult(model="tabbyapi", prompt=prompt, response=text, done=True)
+
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        timeout: float = 120.0,
+    ) -> GenerateResult:
+        """OpenAI-compatible chat completion."""
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        result = _post(f"{self.base_url}/v1/chat/completions", payload, timeout=timeout)
+        if not result:
+            return GenerateResult(model="tabbyapi", prompt="", response="",
+                                  done=False, error="TabbyAPI chat returned no response.")
+        choice = (result.get("choices") or [{}])[0]
+        text = choice.get("message", {}).get("content", "")
+        return GenerateResult(model="tabbyapi", prompt="", response=text, done=True)
+
+
+# ---------------------------------------------------------------------------
+# GPT4All client (free, offline, cross-platform)
+# ---------------------------------------------------------------------------
+
+
+class GPT4AllClient:
+    """Interact with a GPT4All local server (free, https://gpt4all.io).
+
+    GPT4All runs models entirely offline.  When the API server is enabled
+    (Settings → Enable API server) it listens on port ``4891`` and exposes
+    an OpenAI-compatible API.
+
+    Default port: ``4891``.
+    """
+
+    def __init__(self, base_url: str = "http://localhost:4891") -> None:
+        self.base_url = base_url.rstrip("/")
+
+    def is_running(self) -> bool:
+        return _reachable(f"{self.base_url}/v1/models")
+
+    def status(self) -> AIAppStatus:
+        return AIAppStatus(name="GPT4All", url=self.base_url, running=self.is_running())
+
+    def list_models(self) -> List[str]:
+        """Return available model names."""
+        data = _get(f"{self.base_url}/v1/models") or {}
+        return [m.get("id", "") for m in data.get("data", [])]
+
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        timeout: float = 120.0,
+    ) -> GenerateResult:
+        """OpenAI-compatible chat completion via GPT4All's API server."""
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        result = _post(f"{self.base_url}/v1/chat/completions", payload, timeout=timeout)
+        if not result:
+            return GenerateResult(model="gpt4all", prompt="", response="",
+                                  done=False, error="GPT4All returned no response.")
+        choice = (result.get("choices") or [{}])[0]
+        text = choice.get("message", {}).get("content", "")
+        return GenerateResult(model="gpt4all", prompt="", response=text, done=True)
+
+
+# ---------------------------------------------------------------------------
+# Aphrodite Engine client (free, vLLM-compatible, high throughput)
+# ---------------------------------------------------------------------------
+
+
+class AphroditeClient:
+    """Interact with an Aphrodite Engine server (free, OpenAI-compatible).
+
+    Aphrodite Engine (https://github.com/PygmalionAI/aphrodite-engine) is a
+    high-throughput inference engine based on vLLM.  It runs any HuggingFace
+    model and supports AWQ/GPTQ quantisation for lower VRAM usage.
+
+    Default port: ``2242``.
+    """
+
+    def __init__(self, base_url: str = "http://localhost:2242") -> None:
+        self.base_url = base_url.rstrip("/")
+
+    def is_running(self) -> bool:
+        return _reachable(f"{self.base_url}/v1/models")
+
+    def status(self) -> AIAppStatus:
+        return AIAppStatus(name="Aphrodite Engine", url=self.base_url,
+                           running=self.is_running())
+
+    def list_models(self) -> List[str]:
+        """Return loaded model names."""
+        data = _get(f"{self.base_url}/v1/models") or {}
+        return [m.get("id", "") for m in data.get("data", [])]
+
+    def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        timeout: float = 120.0,
+    ) -> GenerateResult:
+        """Generate a completion using Aphrodite's /v1/completions endpoint."""
+        payload: Dict[str, Any] = {
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        result = _post(f"{self.base_url}/v1/completions", payload, timeout=timeout)
+        if not result:
+            return GenerateResult(model="aphrodite", prompt=prompt, response="",
+                                  done=False, error="Aphrodite returned no response.")
+        choice = (result.get("choices") or [{}])[0]
+        text = choice.get("text", "")
+        return GenerateResult(model="aphrodite", prompt=prompt, response=text, done=True)
+
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        timeout: float = 120.0,
+    ) -> GenerateResult:
+        """OpenAI-compatible chat completion."""
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        result = _post(f"{self.base_url}/v1/chat/completions", payload, timeout=timeout)
+        if not result:
+            return GenerateResult(model="aphrodite", prompt="", response="",
+                                  done=False, error="Aphrodite chat returned no response.")
+        choice = (result.get("choices") or [{}])[0]
+        text = choice.get("message", {}).get("content", "")
+        return GenerateResult(model="aphrodite", prompt="", response=text, done=True)
+

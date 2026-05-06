@@ -1139,7 +1139,108 @@ class FreeImage3DClient:
         return result
 
     # ------------------------------------------------------------------
-    # Private helpers
+    # InstantMesh — Apache-2.0, 12 GB VRAM, textured OBJ output
+    # ------------------------------------------------------------------
+
+    def run_instantmesh(
+        self,
+        image_path: str,
+        output_dir: str,
+        config: str = "instant-mesh-large",
+        export_texmap: bool = True,
+        diffusion_steps: int = 75,
+    ) -> FreeImage3DResult:
+        """Run InstantMesh (TencentARC) to convert an image to a textured OBJ.
+
+        InstantMesh produces high-quality multi-view reconstructions from a
+        single photograph in seconds.  Apache-2.0 license.
+
+        Clone it first:
+
+        .. code-block:: bash
+
+            git clone https://github.com/TencentARC/InstantMesh.git ~/AI-Helper/FreeModels/instantmesh
+            cd ~/AI-Helper/FreeModels/instantmesh && pip install -r requirements.txt
+
+        Parameters
+        ----------
+        image_path:
+            Input photo (PNG or JPEG).
+        output_dir:
+            Where to save the OBJ and texture outputs.
+        config:
+            Model config: ``"instant-mesh-large"`` (best, 12 GB) or
+            ``"instant-mesh-base"`` (faster, less VRAM).
+        export_texmap:
+            When ``True``, bake and export a texture map (OBJ + PNG).
+        diffusion_steps:
+            Number of multi-view diffusion steps (default 75).
+        """
+        t0 = time.monotonic()
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        result = FreeImage3DResult(
+            backend="instantmesh",
+            input_image=str(image_path),
+            output_dir=str(out),
+        )
+
+        repo_path = self.repo_root / "instantmesh"
+        run_script = repo_path / "run.py"
+
+        if not run_script.exists():
+            result.error = (
+                f"InstantMesh not found at {repo_path}.\n"
+                "Clone it with:\n"
+                f"  git clone https://github.com/TencentARC/InstantMesh.git {repo_path}\n"
+                f"  pip install -r {repo_path}/requirements.txt\n"
+                "Requires 12 GB+ GPU VRAM."
+            )
+            result.elapsed_s = time.monotonic() - t0
+            return result
+
+        import subprocess  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        config_yaml = str(repo_path / "configs" / f"{config}.yaml")
+        cmd = [
+            sys.executable, str(run_script),
+            config_yaml,
+            str(image_path),
+            "--output-path", str(out),
+            "--diffusion-steps", str(diffusion_steps),
+        ]
+        if export_texmap:
+            cmd.append("--export_texmap")
+
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True,
+                cwd=str(repo_path), timeout=600,
+            )
+            if proc.returncode != 0:
+                result.error = (proc.stderr or proc.stdout).strip()
+            else:
+                for ext in ("obj", "mtl", "png", "glb"):
+                    result.exported_files.extend(
+                        str(p) for p in out.rglob(f"*.{ext}")
+                    )
+                if result.exported_files:
+                    objs = [f for f in result.exported_files if f.endswith(".obj")]
+                    result.mesh_path = objs[0] if objs else result.exported_files[0]
+                    result.success = True
+                else:
+                    result.error = "InstantMesh completed but no output files found."
+        except subprocess.TimeoutExpired:
+            result.error = "InstantMesh timed out after 600 s."
+        except Exception as exc:  # noqa: BLE001
+            result.error = str(exc)
+
+        result.elapsed_s = time.monotonic() - t0
+        return result
+
+    # ------------------------------------------------------------------
+    # Private helpers (FreeImage3DClient)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -1154,7 +1255,6 @@ class FreeImage3DClient:
 # ---------------------------------------------------------------------------
 # Fallout 4 domain knowledge
 # ---------------------------------------------------------------------------
-
 
 _FO4_KNOWLEDGE: Dict[str, Any] = {
     "polygon_budgets": {
@@ -1293,6 +1393,239 @@ _FO4_KNOWLEDGE: Dict[str, Any] = {
         "purple_mesh": "Missing normal map — ensure _n.dds is BC5 compressed",
         "t_pose": "Skeleton not properly bound; skinning weights need re-bake",
         "nif_version_mismatch": "Must be version 20.2.0.7 / uv2=12 / uv2_2=130",
+        "missing_textures_ck": "Ensure texture paths in NIF are relative to Data/Textures/; use forward slashes",
+        "floating_vertices": "Run Remove Doubles / Merge by Distance in Blender before export",
+        "inside_out_normals": "Ctrl+N (Recalculate Outside) in Blender Edit Mode to fix flipped normals",
+        "seams_visible": "UV seams visible in-game — bake ambient occlusion or improve UV island placement",
+        "physics_explosion": "Havok mass too high or shape mismatch — check bhkRigidBody mass and restitution",
+    },
+    "shader_flags": {
+        "overview": (
+            "BSLightingShaderProperty has two 32-bit flag registers: "
+            "SLSF1 (Shader Flags 1) and SLSF2 (Shader Flags 2). "
+            "These control rendering features like specularity, glow, parallax, etc."
+        ),
+        "SLSF1_common": {
+            "SLSF1_Specular": "bit 0 — enables specular highlights (almost always on)",
+            "SLSF1_Skinned": "bit 1 — required for any skinned/animated mesh",
+            "SLSF1_Temp_Refraction": "bit 2 — temporary refraction (rarely used)",
+            "SLSF1_Vertex_Alpha": "bit 3 — use vertex alpha channel",
+            "SLSF1_Greyscale_To_PaletteColor": "bit 4 — for inventory/dye system",
+            "SLSF1_Greyscale_To_PaletteAlpha": "bit 5 — alpha from greyscale palette",
+            "SLSF1_Use_Falloff": "bit 6 — distance-based alpha falloff (hair, grass)",
+            "SLSF1_Environment_Mapping": "bit 7 — cube/sphere environment map",
+            "SLSF1_Recieve_Shadows": "bit 9 — mesh receives shadows from other objects",
+            "SLSF1_Cast_Shadows": "bit 10 — mesh casts shadows onto other objects",
+            "SLSF1_Facegen_Detail_Map": "bit 11 — used on character face detail",
+            "SLSF1_Parallax": "bit 12 — parallax occlusion mapping (expensive)",
+            "SLSF1_Model_Space_Normals": "bit 13 — tangent space vs model space normals",
+            "SLSF1_Non_Projective_Shadows": "bit 14 — cheaper shadow method",
+            "SLSF1_Landscape": "bit 16 — landscape shader (terrain only)",
+            "SLSF1_Refraction": "bit 17 — refraction / glass effect",
+            "SLSF1_Fire_Refraction": "bit 18 — fire shader",
+            "SLSF1_Eye_Environment_Mapping": "bit 19 — eye shader env map",
+            "SLSF1_Hair_Soft_Lighting": "bit 20 — soft anisotropic lighting for hair",
+            "SLSF1_Screendoor_Alpha_Fade": "bit 21 — screen-door transparency",
+            "SLSF1_Localmap_Hide_Secret": "bit 22 — hide on local map",
+            "SLSF1_FaceGenRGBTint": "bit 23 — RGB tint applied to character faces",
+            "SLSF1_Own_Emit": "bit 24 — self-illumination / emissive mesh",
+            "SLSF1_Projected_UV": "bit 25 — UV projection (decals)",
+            "SLSF1_Multiple_Textures": "bit 26 — enable multi-layered texturing",
+            "SLSF1_Remappable_Textures": "bit 27 — allow texture remapping (dye)",
+            "SLSF1_Decal": "bit 28 — decal blending mode",
+            "SLSF1_Dynamic_Decal": "bit 29 — dynamic decal",
+            "SLSF1_Zbuffer_Test": "bit 31 — z-buffer depth test (almost always on)",
+        },
+        "SLSF2_common": {
+            "SLSF2_ZBuffer_Write": "bit 0 — write to z-buffer (on for all opaque objects)",
+            "SLSF2_LOD_Landscape": "bit 1 — LOD landscape mesh flag",
+            "SLSF2_LOD_Objects": "bit 2 — LOD object mesh flag",
+            "SLSF2_No_Fade": "bit 3 — disables fade-out on LOD transition",
+            "SLSF2_Double_Sided": "bit 4 — render both front and back faces (leaves, wire)",
+            "SLSF2_Vertex_Colors": "bit 5 — use per-vertex colours",
+            "SLSF2_Glow_Map": "bit 6 — use glow/emission map (_g.dds)",
+            "SLSF2_Assume_Shadowmask": "bit 7 — use shadow mask",
+            "SLSF2_Packed_Tangent": "bit 8 — packed tangent data format",
+            "SLSF2_Multi_Layer_Parallax": "bit 9 — expensive multi-layer parallax",
+            "SLSF2_Soft_Lighting": "bit 10 — soft wrap lighting",
+            "SLSF2_Rim_Lighting": "bit 11 — rim light effect",
+            "SLSF2_Back_Lighting": "bit 12 — back-scatter lighting (leaves/hair)",
+            "SLSF2_No_LOD_Land_Blend": "bit 14 — skip LOD landscape blending",
+            "SLSF2_Wireframe": "bit 15 — wireframe debug rendering",
+            "SLSF2_Weapon_Blood": "bit 16 — allow weapon blood overlay",
+            "SLSF2_Hide_On_Local_Map": "bit 17 — not shown on local map",
+            "SLSF2_Premult_Alpha": "bit 18 — premultiplied alpha",
+            "SLSF2_Cloud_LOD": "bit 19 — cloud LOD shader",
+            "SLSF2_Anisotropic_Lighting": "bit 20 — anisotropic specular (metal, hair)",
+            "SLSF2_No_Transparency_Multisampling": "bit 21 — skip MSAA for transparent",
+            "SLSF2_Unused01": "bit 22 — unused",
+            "SLSF2_Multi_Index_Snow": "bit 23 — multi-index snow shader",
+            "SLSF2_Vertex_Lighting": "bit 24 — per-vertex lighting (cheaper, older)",
+            "SLSF2_Uniform_Scale": "bit 25 — enforce uniform scaling",
+            "SLSF2_Fit_Slope": "bit 26 — slope fitting (grass/terrain)",
+            "SLSF2_Billboard": "bit 27 — always face camera (grass, particles)",
+            "SLSF2_No_LOD_Land_Blend2": "bit 28 — second LOD blend skip flag",
+            "SLSF2_EnvMap_Light_Fade": "bit 29 — fade env map with distance",
+            "SLSF2_Wireframe2": "bit 30 — secondary wireframe flag",
+            "SLSF2_Weapon_Blood2": "bit 31 — secondary weapon blood flag",
+        },
+        "typical_static_prop": "SLSF1: Specular + Recieve_Shadows + Cast_Shadows + Zbuffer_Test; SLSF2: ZBuffer_Write + Vertex_Colors",
+        "typical_weapon": "SLSF1: Specular + Recieve_Shadows + Cast_Shadows + Zbuffer_Test; SLSF2: ZBuffer_Write + Glow_Map (if emissive)",
+        "double_sided_mesh": "Add SLSF2_Double_Sided for leaves, fabric, wire; do NOT use on solid objects (kills backface culling)",
+        "glowing_object": "SLSF1: Own_Emit; SLSF2: Glow_Map. Supply a _g.dds glow map.",
+    },
+    "material_types": {
+        "overview": (
+            "Fallout 4 uses BGSM/BGEM material files (in Data/Materials/) that "
+            "reference textures and shader settings.  The NIF BSLightingShaderProperty "
+            "can reference a .bgsm file instead of embedding paths directly."
+        ),
+        "BGSM": "Standard material — diffuse, normal, specular, glow maps. Used for most props, weapons, armour.",
+        "BGEM": "Effect material — glow, decal, environment map effects. Used for special FX meshes.",
+        "file_extension": ".bgsm (standard) or .bgem (effect)",
+        "path": "Data/Materials/<category>/<name>.bgsm",
+        "tools": [
+            "Material Editor (free, included with Creation Kit)",
+            "B.A.E. / BSA Browser (free) — extract vanilla .bgsm files to inspect",
+            "xEdit (FO4Edit) — read material paths in placed objects",
+        ],
+        "pbr_channels_in_bgsm": {
+            "diffuse": "BaseColorTexture — sRGB, BC1/BC3",
+            "normal": "NormalTexture — linear, BC5",
+            "smoothness": "SmoothSpecTexture — packed R=smooth G=metal in some shaders",
+            "glow": "GlowTexture — BC1",
+            "environment": "EnvmapTexture — cube map path",
+        },
+        "note": "When no .bgsm is referenced, texture paths are stored directly in BSLightingShaderProperty BSTextureSet.",
+    },
+    "animation_rigging": {
+        "overview": "Animated meshes (characters, weapons, creatures) need a skeleton NIF and skin bindings.",
+        "skeleton_nif": "Data/Meshes/Actors/<ActorType>/CharacterAssets/skeleton.nif — defines bone hierarchy",
+        "skin_block": "BSSkin::BoneData and BSSkin::Instance blocks store vertex weights per bone",
+        "max_bones_per_vertex": "4 bones influence per vertex (hardware limit)",
+        "max_bones_per_partition": "80 bones per NiSkinPartition partition",
+        "weight_painting": "Blender weight paint mode — use envelope falloff, normalise weights before export",
+        "pose_space": "Bind pose must match the skeleton NIF exactly; export from rest pose",
+        "animation_format": "HKX (Havok) — use Havok Content Tools or hkxconv (free) to convert",
+        "idle_animations": "Data/Meshes/AnimTextData/ and Data/Animations/",
+        "papyrus_trigger": "Use game Papyrus script or AnimationEvent to trigger animations",
+        "nif_shape_keys": "Not supported natively; use animation controller blocks for morphs",
+        "tools": [
+            "hkxconv (free, GitHub: niftools/hkxconv) — convert Havok animation formats",
+            "Blender HKX Tools add-on (free, GitHub) — import/export HKX from Blender",
+            "NifTools Blender add-on — handles NIF skinning and bone export",
+            "Outfit Studio (free, GitHub: ousnius/BodySlide-and-Outfit-Studio) — body/outfit morphing",
+        ],
+    },
+    "weapon_mods": {
+        "overview": "Fallout 4 weapon mods use the Constructible Object system + attach node hierarchy.",
+        "attach_nodes": "Weapons have named attach nodes (AP_Barrel, AP_Grip, AP_Mag, etc.) in the NIF",
+        "ap_naming": "All attach point nodes start with 'AP_'; check vanilla weapon NIFs for reference",
+        "mod_nif": "Each mod piece is a separate NIF with geometry matching the attach node",
+        "mod_esp": "Define OMOD records in xEdit or Creation Kit; link to AP node and mesh",
+        "material_swap": "Use NIF BSGeometry / BSSubIndexTriShape for material-swap mods",
+        "lod_for_weapons": "Weapons typically only need LOD0 (1st person) and LOD1 (3rd person at distance)",
+        "first_person_mesh": "Separate _1stPerson NIF in Data/Meshes/Weapons/<Name>/1stPerson/",
+        "third_person_mesh": "Data/Meshes/Weapons/<Name>/<WeaponName>.nif",
+        "holster_transform": "Holster bone transform defined in the weapon NIF; adjust for belt clip etc.",
+        "impact_data": "ImpactDataSet record controls bullet impact effects (spark, gore, etc.)",
+        "damage_state_nodes": "Multi-part weapons use damage state nodes for visual wear progression",
+    },
+    "workshop_items": {
+        "overview": "Workshop / settlement objects use the Workshop item system and snap points.",
+        "snap_points": "Use NiNode named 'P-SNP-<name>' for snap connection points",
+        "workshop_keyword": "Add WorkshopItemKeyword to the FLST in the ESP to enable workshop placement",
+        "size_limits": "Small < 1000 tris, Medium < 3000, Large < 6000; always test in-engine",
+        "stacking_rule": "Objects that stack need matching snap point pairs (P-SNP-TOP / P-SNP-BOTTOM)",
+        "power_connections": "Power snap nodes: P-SNP-POWER-IN, P-SNP-POWER-OUT",
+        "destruction_data": "Optional — link to destruction NIF stages for damaged states",
+        "activator_collision": "Workshop activators need 'L_TRIGGER' or 'L_STATIC' layer collision",
+        "material_swap_workshop": "Texture variants use Material Swap records in xEdit",
+        "required_components": "Define CNAM (constructible object) with component costs",
+        "lighting_fixtures": "Light attachments use LightData block in NIF + Place Light reference in CK",
+    },
+    "blender_niftools_workflow": {
+        "plugin_url": "https://github.com/niftools/blender_niftools_addon",
+        "install": "Edit → Preferences → Add-ons → Install → select blender_niftools_addon.zip",
+        "import_nif": "File → Import → NetImmerse/Gamebryo (.nif) — opens the NIF into Blender",
+        "export_nif": "File → Export → NetImmerse/Gamebryo (.nif) — writes back to NIF",
+        "export_settings": {
+            "Game": "Select 'Fallout 4' from the Game dropdown",
+            "Scale Correction": "Leave at 1.0; FO4 export preset handles units",
+            "Flatten Skin": "Check for skinned meshes to flatten modifier stack",
+        },
+        "bsxflags": "Set in NIF Properties panel; bit 1 = collision, bit 2 = havok, bit 9 = dynamic",
+        "collision_workflow": [
+            "1. Create a simplified collision mesh (low-poly convex hull or box)",
+            "2. Name it 'BSX' or prefix with collision layer",
+            "3. In NIF Properties, set Collision Object Type = 'MoppBvTree' or 'ConvexVertices'",
+            "4. Assign Havok Material (OL_STATIC for static, OL_CLUTTER for moveable items)",
+            "5. Export — NifTools will auto-generate bhkCollisionObject blocks",
+        ],
+        "uv_export": "UV maps must be named 'UVMap' (first UV) for correct NIF export",
+        "multiple_uvs": "Second UV for lightmap/AO stored as 'UVMap2' — only some shader types support",
+        "vertex_colors": "Vertex colours exported if SLSF2_Vertex_Colors flag is set",
+        "material_assignment": "Each material in Blender becomes a separate BSTextureSet in the NIF",
+        "lod_export": "Export each LOD level to a separate NIF; LOD suffix: _lod_0, _lod_1, _lod_2",
+    },
+    "texconv_commands": {
+        "overview": "Texconv (free, Microsoft/DirectXTex) is the fastest CLI DDS batch converter.",
+        "install": "Download from https://github.com/Microsoft/DirectXTex/releases (texconv.exe)",
+        "diffuse_bc1": "texconv -f BC1_UNORM -srgb -m 0 texture_d.png  # opaque diffuse",
+        "diffuse_bc3": "texconv -f BC3_UNORM -srgb -m 0 texture_d.png  # diffuse with alpha",
+        "normal_bc5": "texconv -f BC5_UNORM -m 0 texture_n.png          # normal map (BC5 = ATI2)",
+        "specular_bc1": "texconv -f BC1_UNORM -m 0 texture_s.png        # specular map",
+        "glow_bc1": "texconv -f BC1_UNORM -srgb -m 0 texture_g.png      # glow/emission",
+        "batch_convert": "for %f in (*.png) do texconv -f BC1_UNORM -srgb -m 0 %f",
+        "output_folder": "texconv -o ./DDS/ -f BC1_UNORM *.png          # output to subfolder",
+        "mipmap_count": "-m 0 = auto-generate all mipmaps (recommended); -m 1 = no mipmaps",
+        "premul_alpha": "-pmalpha flag — premultiply alpha (needed for some effect shaders)",
+        "resize_pow2": "-w 1024 -h 1024 — resize to power-of-two before conversion",
+        "srgb_note": "Use -srgb for colour maps (diffuse, glow). Do NOT use -srgb for normal/specular.",
+        "bc7_note": "BC7 is higher quality than BC1/BC3 for diffuse but may not load in older Creation Kit versions; test first.",
+    },
+    "nifskope_tips": {
+        "overview": "NifSkope 2.0 (free) is the primary NIF viewer and editor.",
+        "install": "Download from https://github.com/niftools/nifskope/releases",
+        "set_texture_paths": "Right-click BSTextureSet → Array Editor → set each texture slot path",
+        "fix_shader_flags": "Right-click BSLightingShaderProperty → Block Details → edit Shader Flags 1 / 2",
+        "check_collision": "View → Block List → look for bhkCollisionObject; click to highlight in viewport",
+        "update_tangents": "Spells → Mesh → Update Tangent Spaces — run after modifying UVs",
+        "spell_sanitize": "Spells → Sanitize → Remove Bogus Nodes — cleans up export artefacts",
+        "batch_texture_repath": "Spells → Texture → Find and Replace Texture — bulk repath texture strings",
+        "bounding_sphere": "Spells → Mesh → Update Bounds — recalculate after vertex edits",
+        "vertex_data": "Spells → Mesh → Face Normals — visualise normals in viewport",
+        "copy_branch": "Right-click block → Copy Branch — paste into another NIF",
+        "merge_niif": "File → Import → import another NIF to merge (experimental)",
+        "fo4_game_path": "Options → Resources → Set Game Path to your Fallout 4 folder for texture preview",
+    },
+    "meshroom_photogrammetry": {
+        "overview": "Meshroom (free, AliceVision) is a full photogrammetry pipeline — best for realistic scans.",
+        "install": "Download from https://github.com/alicevision/Meshroom/releases (standalone)",
+        "minimum_photos": "20-30 photographs minimum; 60-100 for best quality",
+        "photo_tips": [
+            "Shoot in diffuse light (overcast day or lightbox) — avoid harsh shadows",
+            "Overlap each shot by at least 60% with the previous",
+            "Capture from multiple angles: 0°, 45°, 90° elevation rings",
+            "Keep object stationary — rotate camera around object, not object",
+            "Use a plain/contrasting background for easier masking",
+            "Avoid reflective or translucent surfaces without powder spray",
+        ],
+        "pipeline_stages": [
+            "1. FeatureExtraction — detect SIFT/AKAZE keypoints in each image",
+            "2. ImageMatching — find common features between image pairs",
+            "3. FeatureMatching — match keypoints across images",
+            "4. StructureFromMotion — compute camera poses + sparse point cloud",
+            "5. PrepareDenseScene — undistort images for MVS",
+            "6. DepthMap — estimate per-image depth maps (GPU required)",
+            "7. DepthMapFilter — filter noisy depth estimates",
+            "8. Meshing — fuse depth maps into a dense mesh",
+            "9. MeshFiltering — clean up geometry",
+            "10. Texturing — bake diffuse texture map onto mesh",
+        ],
+        "output_for_fo4": "Export OBJ + texture PNG from Meshroom → import into Blender → retopology → UV unwrap → NIF export",
+        "gpu_requirement": "DepthMap stage requires CUDA GPU (Nvidia); CPU fallback exists but is very slow",
+        "vram_requirement": "8 GB+ VRAM recommended for DepthMap on large photo sets",
     },
 }
 
@@ -1313,6 +1646,32 @@ _KNOWLEDGE_KEYWORDS: List[Tuple[List[str], str]] = [
      "lod_tiers"),
     (["collision", "havok", "bhk", "physics", "rigid body", "convex"],
      "collision_types"),
+    (["shader flag", "slsf", "slsf1", "slsf2", "specular flag", "double sided",
+      "glow flag", "vertex color flag", "skinned flag"],
+     "shader_flags"),
+    (["material", "bgsm", "bgem", "material file", "material editor", "pbr material"],
+     "material_types"),
+    (["animation", "skeleton", "bone", "rig", "weight", "skin", "hkx", "havok anim",
+      "weight paint", "skinning", "bind pose"],
+     "animation_rigging"),
+    (["weapon mod", "attach node", "ap_", "barrel", "grip", "magazine", "mod piece",
+      "omod", "first person", "1st person"],
+     "weapon_mods"),
+    (["workshop", "settlement", "snap point", "snap node", "crafting", "build menu",
+      "power connection", "workshop item"],
+     "workshop_items"),
+    (["blender", "niftools", "export nif", "import nif", "blender addon", "nif export",
+      "uv map", "vertex colour", "blender workflow"],
+     "blender_niftools_workflow"),
+    (["texconv", "dds convert", "batch dds", "bc1 convert", "bc5 convert", "dds batch",
+      "dds tool", "directxtex", "microsoft texconv"],
+     "texconv_commands"),
+    (["nifskope", "nif viewer", "shader flag editor", "texture path", "tangent space",
+      "bounding sphere", "nif editor"],
+     "nifskope_tips"),
+    (["meshroom", "photogrammetry", "alicevision", "structure from motion", "sfm",
+      "photo scan", "depth map", "dense reconstruction"],
+     "meshroom_photogrammetry"),
     (["scale", "unit", "size", "metre", "meter", "bethesda unit"],
      "scale"),
     (["axis", "coordinate", "handedness", "z-up", "y-forward", "blender"],
@@ -2279,6 +2638,7 @@ class MeshEngine:
             "trellis": self.free_client.run_trellis,
             "triposr": self.free_client.run_triposr,
             "shap_e": self.free_client.run_shap_e,
+            "instantmesh": self.free_client.run_instantmesh,
         }
         runner = dispatch.get(backend)
         if runner is None:

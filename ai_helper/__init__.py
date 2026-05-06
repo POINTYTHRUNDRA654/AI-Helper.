@@ -102,11 +102,14 @@ except Exception:  # noqa: BLE001
 try:
     from .gemma_finetuner import (
         GemmaFineTuner,
+        UnslothFineTuner,
         FineTuneConfig,
         GPUMemoryProfiler,
         GEMMA_MODELS,
         TrainingResult,
         InferenceResult,
+        prepare_mossy_dataset,
+        list_recommended_models,
     )
     _GEMMA_AVAILABLE = True
 except Exception:  # noqa: BLE001
