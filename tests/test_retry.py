@@ -151,8 +151,7 @@ class TestCircuitBreaker(unittest.TestCase):
         with self.assertRaises(Exception):
             cb.call(lambda: (_ for _ in ()).throw(Exception("fail")))
         time.sleep(0.08)
-        cb._state_check_for_test = True
-        # Probe fails
+        # Probe fails → should re-open
         with self.assertRaises(Exception):
             cb.call(lambda: (_ for _ in ()).throw(Exception("still failing")))
         self.assertEqual(cb.state, "OPEN")

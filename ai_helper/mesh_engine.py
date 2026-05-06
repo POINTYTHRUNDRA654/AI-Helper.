@@ -239,6 +239,15 @@ class MeshyClient:
             logger.warning("Meshy task %s has no %r download URL.", task.task_id, fmt)
             return None
 
+        # Validate that the URL is from a Meshy domain to prevent SSRF
+        parsed_url = urllib.parse.urlparse(url)
+        if "meshy.ai" not in parsed_url.netloc and not parsed_url.netloc.endswith(".meshy.ai"):
+            logger.error(
+                "Meshy download URL has unexpected domain %r — refusing to fetch.",
+                parsed_url.netloc,
+            )
+            return None
+
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         dest = out_dir / f"meshy_{task.task_id}.{fmt}"
@@ -1113,8 +1122,11 @@ class FreeImage3DClient:
             )
             obj_path = str(out / f"shap_e_{Path(image_path).stem}.obj")
             t_mesh = decode_latent_mesh(xm, latents[0]).tri_mesh()
-            with open(obj_path, "w", encoding="utf-8") as fh:
-                t_mesh.write_obj(fh)
+            try:
+                with open(obj_path, "w", encoding="utf-8") as fh:
+                    t_mesh.write_obj(fh)
+            except Exception as write_exc:  # noqa: BLE001
+                raise RuntimeError(f"Failed to write Shap-E OBJ: {write_exc}") from write_exc
             result.exported_files.append(obj_path)
             result.mesh_path = obj_path
             result.success = True
@@ -1825,7 +1837,7 @@ class FalloutMeshExporter:
             fh.write(f"# Scale applied: {self.game_scale} (FO4 units)\n\n")
             fh.write(f"o {mesh_name}\n\n")
             for v in vertices:
-                fh.write(f"v {v[0]:.6f} {v[2]:.6f} {-v[1]:.6f}\n")  # Z-up → Y-up flip
+                fh.write(f"v {v[0]:.6f} {v[2]:.6f} {-v[1]:.6f}\n")  # Blender Z-up/Y-forward → OBJ Y-up convention (X, Z, -Y)
             fh.write("\n")
             for tri in faces:
                 fh.write(f"f {tri[0]+1} {tri[1]+1} {tri[2]+1}\n")

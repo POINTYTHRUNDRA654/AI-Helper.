@@ -166,7 +166,12 @@ class Speaker:
         return self._queue.qsize()
 
     def set_rate(self, rate: int) -> None:
-        """Change the speech rate (words per minute) on the fly."""
+        """Change the speech rate (words per minute) on the fly.
+
+        Rate is clamped to the range 50–300 WPM which covers all
+        pyttsx3-compatible TTS engines.
+        """
+        rate = max(50, min(300, rate))
         self.settings.rate = rate
         if self._engine is not None:
             try:

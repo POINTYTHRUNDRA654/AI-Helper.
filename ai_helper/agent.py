@@ -215,16 +215,18 @@ class Agent:
         for step_num in range(1, self.max_steps + 1):
             t_step = time.monotonic()
 
-            # Retry the LLM call on transient errors
+            # Retry the LLM call on transient errors.
+            # llm_retry_attempts=2 means: 1 initial call + 2 retries = 3 total attempts.
             llm_result = None
-            for attempt in range(1, self.llm_retry_attempts + 2):
+            total_attempts = self.llm_retry_attempts + 1
+            for attempt in range(1, total_attempts + 1):
                 llm_result = client.chat(self.ollama_model, messages, timeout=60.0)
                 if not llm_result.error:
                     break
-                if attempt <= self.llm_retry_attempts:
+                if attempt < total_attempts:
                     logger.warning(
                         "LLM call failed (attempt %d/%d): %s — retrying…",
-                        attempt, self.llm_retry_attempts + 1, llm_result.error,
+                        attempt, total_attempts, llm_result.error,
                     )
                     time.sleep(1.0 * attempt)
 
@@ -478,6 +480,8 @@ class Agent:
         if len(messages) <= limit:
             return
         system = messages[0]
+        # Take (limit - 1) most recent messages so that after re-inserting
+        # the system prompt the total is exactly `limit` messages.
         recent = messages[-(limit - 1):]
         messages.clear()
         messages.append(system)

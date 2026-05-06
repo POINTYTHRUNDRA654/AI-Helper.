@@ -707,8 +707,13 @@ def _register_builtin_tools(reg: ToolRegistry) -> None:
         """Fetch a URL and return the text content."""
         import urllib.request as _urllib  # noqa: PLC0415
         import urllib.error as _urllib_err  # noqa: PLC0415
+        import urllib.parse as _urlparse  # noqa: PLC0415
         import html  # noqa: PLC0415
         import re as _re  # noqa: PLC0415
+        # Validate URL scheme — only allow http/https to prevent SSRF
+        parsed = _urlparse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return _err("web_fetch", f"Disallowed URL scheme {parsed.scheme!r}. Only http/https are allowed.")
         try:
             req = _urllib.Request(
                 url,
@@ -844,13 +849,22 @@ def _register_builtin_tools(reg: ToolRegistry) -> None:
         import shutil as _shutil  # noqa: PLC0415
         import subprocess as _subprocess  # noqa: PLC0415
         if _shutil.which("scrot"):
-            _subprocess.run(["scrot", str(dest)], check=False, timeout=10)
-            if dest.exists():
+            proc = _subprocess.run(
+                ["scrot", str(dest)], capture_output=True, text=True, timeout=10
+            )
+            if proc.returncode != 0:
+                logger.warning("scrot failed (rc=%d): %s", proc.returncode, proc.stderr.strip())
+            elif dest.exists():
                 return _ok("screenshot", f"Screenshot saved: {dest}", data={"path": str(dest)})
         # Fallback: gnome-screenshot
         if _shutil.which("gnome-screenshot"):
-            _subprocess.run(["gnome-screenshot", "-f", str(dest)], check=False, timeout=10)
-            if dest.exists():
+            proc = _subprocess.run(
+                ["gnome-screenshot", "-f", str(dest)], capture_output=True, text=True, timeout=10
+            )
+            if proc.returncode != 0:
+                logger.warning("gnome-screenshot failed (rc=%d): %s",
+                               proc.returncode, proc.stderr.strip())
+            elif dest.exists():
                 return _ok("screenshot", f"Screenshot saved: {dest}", data={"path": str(dest)})
         return _err("screenshot",
                     "No screenshot tool available. Install Pillow (pip install Pillow) or scrot.")
