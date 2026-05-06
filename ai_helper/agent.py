@@ -138,6 +138,14 @@ class Agent:
         Ollama server URL (default ``"http://localhost:11434"``).
     max_steps:
         Maximum tool-call iterations before giving up (default ``10``).
+    max_context_messages:
+        Maximum number of messages to keep in the LLM context window.
+        Older messages are pruned (keeping the system prompt and the most
+        recent exchanges) to avoid exceeding the model's context limit.
+        Default: 40 messages.
+    llm_retry_attempts:
+        Number of times to retry a failed LLM call before giving up.
+        Default: 2.
     """
 
     _FINISH = "finish"
@@ -148,11 +156,15 @@ class Agent:
         ollama_model: str = "llama3",
         ollama_url: str = "http://localhost:11434",
         max_steps: int = 10,
+        max_context_messages: int = 40,
+        llm_retry_attempts: int = 2,
     ) -> None:
         self.registry = registry or ToolRegistry()
         self.ollama_model = ollama_model
         self.ollama_url = ollama_url
         self.max_steps = max_steps
+        self.max_context_messages = max_context_messages
+        self.llm_retry_attempts = llm_retry_attempts
 
     # ------------------------------------------------------------------
     # Public API
@@ -202,7 +214,19 @@ class Agent:
 
         for step_num in range(1, self.max_steps + 1):
             t_step = time.monotonic()
-            llm_result = client.chat(self.ollama_model, messages, timeout=60.0)
+
+            # Retry the LLM call on transient errors
+            llm_result = None
+            for attempt in range(1, self.llm_retry_attempts + 2):
+                llm_result = client.chat(self.ollama_model, messages, timeout=60.0)
+                if not llm_result.error:
+                    break
+                if attempt <= self.llm_retry_attempts:
+                    logger.warning(
+                        "LLM call failed (attempt %d/%d): %s — retrying…",
+                        attempt, self.llm_retry_attempts + 1, llm_result.error,
+                    )
+                    time.sleep(1.0 * attempt)
 
             if llm_result.error:
                 result.answer = f"Ollama error: {llm_result.error}"
@@ -240,6 +264,9 @@ class Agent:
             messages.append({"role": "assistant", "content": raw})
             observation = tool_result.output if tool_result.success else f"Error: {tool_result.error}"
             messages.append({"role": "user", "content": f"Tool result:\n{observation}"})
+
+            # Prune context window: keep system prompt + most recent messages
+            self._prune_messages(messages)
 
         if not result.answer:
             result.answer = (
@@ -293,6 +320,31 @@ class Agent:
         (r"\bnif\b|bstriShape|bsfadenode|collision.*mesh|mesh.*nif|fallout.*4.*mesh"
          r"|polygon.*fallout|texture.*fallout|lod.*fallout",
          "mesh_ask", {}),
+        # web
+        (r"\bfetch\b.+url|get.+webpage|download.+page|browse\s+to|visit\s+http",
+         "web_fetch", {}),
+        (r"\bopen\b.+(url|link|http|website|browser)|go\s+to\s+http",
+         "open_url", {}),
+        # voice
+        (r"\bspeak\b|say\s+.{3,}|read.*aloud|text.to.speech|tts",
+         "speak", {}),
+        (r"\blist.*voice|available.*voice|voice.*option",
+         "list_voices", {}),
+        (r"\bset.*voice|change.*voice|switch.*voice",
+         "set_voice", {}),
+        # screenshot
+        (r"\bscreenshot|screen.*capture|capture.*screen|take.*picture.*screen",
+         "screenshot", {}),
+        # clipboard
+        (r"\bclipboard.*read|read.*clipboard|paste.*content|what.*clipboard",
+         "clipboard_read", {}),
+        (r"\bclipboard.*write|copy.*clipboard|write.*clipboard",
+         "clipboard_write", {}),
+        # resilience
+        (r"\bcircuit.breaker|service.*status.*breaker|breaker.*status",
+         "circuit_breaker_status", {}),
+        (r"\breset.*circuit|circuit.*reset",
+         "reset_circuit_breaker", {}),
         (r"\bcpu\b|\bmemory\b|\bdisk\b|system\s+stat|resource",
          "system_snapshot", {}),
         (r"\bprocesses?\b|running programs?|what.+running",
@@ -388,11 +440,49 @@ class Agent:
             return args
         if tool_name == "mesh_validate":
             return {"mesh_path": path or first_quoted or ""}
+        # Web tools
+        if tool_name in ("web_fetch", "open_url"):
+            url_m = re.search(r"https?://\S+", goal)
+            url = url_m.group(0).rstrip(".,;)") if url_m else first_quoted or ""
+            return {"url": url}
+        # Voice tools
+        if tool_name == "speak":
+            # Use whatever comes after "say" or "speak"
+            say_m = re.search(r"(?:say|speak|read\s+aloud)\s+[\"']?(.+)", goal, re.IGNORECASE)
+            text = say_m.group(1).strip("\"'") if say_m else first_quoted or goal
+            return {"text": text}
+        if tool_name == "set_voice":
+            return {"voice_id": first_quoted or path or ""}
+        if tool_name == "clipboard_write":
+            return {"text": first_quoted or ""}
+        if tool_name == "reset_circuit_breaker":
+            svc_m = re.search(
+                r"\b(ollama|lmstudio|comfyui|sdwebui|openwebui|localai|textgen|oobabooga|jan|llamacpp)\b",
+                goal.lower()
+            )
+            return {"service": svc_m.group(1) if svc_m else "ollama"}
         return {}
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _prune_messages(self, messages: List[Dict[str, str]]) -> None:
+        """Keep context within ``max_context_messages``.
+
+        Always preserves the system prompt (index 0) and the most
+        recent ``max_context_messages - 1`` messages so the model
+        retains context about the current task.
+        """
+        limit = self.max_context_messages
+        if len(messages) <= limit:
+            return
+        system = messages[0]
+        recent = messages[-(limit - 1):]
+        messages.clear()
+        messages.append(system)
+        messages.extend(recent)
+        logger.debug("Context window pruned to %d messages.", len(messages))
 
     def _ollama_available(self) -> bool:
         try:

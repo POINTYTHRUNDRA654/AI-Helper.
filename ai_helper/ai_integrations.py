@@ -31,6 +31,13 @@ For local model training and fine-tuning, see ``gemma_finetuner`` module:
 All HTTP calls use the standard-library ``urllib`` — no extra packages
 needed.  Each integration gracefully returns ``running=False`` if the
 server is not reachable.
+
+Resilience
+----------
+:func:`_get` and :func:`_post` apply retry logic (up to 2 extra attempts
+with exponential back-off) for transient network errors.  Each AI program
+client also has a :class:`~ai_helper.retry.CircuitBreaker` so that a
+down server does not block the monitoring loop.
 """
 
 from __future__ import annotations
@@ -44,9 +51,25 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .retry import CircuitBreaker, with_retry
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 3.0   # seconds for HTTP health checks
+
+# One circuit breaker per well-known local service.
+# They share the same conservative thresholds — 3 consecutive failures opens
+# the circuit for 20 s before a probe call is allowed through.
+_BREAKERS: Dict[str, CircuitBreaker] = {
+    name: CircuitBreaker(name=name, failure_threshold=3, recovery_timeout=20.0)
+    for name in ("ollama", "lmstudio", "comfyui", "sdwebui", "openwebui",
+                 "localai", "textgen", "oobabooga", "jan", "llamacpp")
+}
+
+
+# ---------------------------------------------------------------------------
+# Data types
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -94,30 +117,42 @@ class GenerateResult:
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers (stdlib only)
+# HTTP helpers (stdlib only) — with retry and graceful error handling
 # ---------------------------------------------------------------------------
+
+
+@with_retry(max_attempts=2, backoff_base=0.5, exceptions=(OSError, urllib.error.URLError))
+def _get_raw(url: str, timeout: float) -> Optional[Any]:
+    """GET *url* and return parsed JSON.  Raises on network error (for retry)."""
+    with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+        return json.loads(resp.read().decode())
 
 
 def _get(url: str, timeout: float = _DEFAULT_TIMEOUT) -> Optional[Any]:
     """GET *url* and return parsed JSON, or None on any error."""
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
-            return json.loads(resp.read().decode())
+        return _get_raw(url, timeout)
     except Exception:  # noqa: BLE001
         return None
+
+
+@with_retry(max_attempts=2, backoff_base=0.5, exceptions=(OSError, urllib.error.URLError))
+def _post_raw(url: str, payload: Dict[str, Any], timeout: float) -> Optional[Any]:
+    """POST JSON *payload* to *url* and return parsed JSON response.  Raises on error."""
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(  # noqa: S310
+        url, data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        return json.loads(resp.read().decode())
 
 
 def _post(url: str, payload: Dict[str, Any], timeout: float = _DEFAULT_TIMEOUT) -> Optional[Any]:
     """POST JSON *payload* to *url* and return parsed JSON response, or None."""
     try:
-        data = json.dumps(payload).encode()
-        req = urllib.request.Request(  # noqa: S310
-            url, data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-            return json.loads(resp.read().decode())
+        return _post_raw(url, payload, timeout)
     except Exception:  # noqa: BLE001
         return None
 

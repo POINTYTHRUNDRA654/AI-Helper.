@@ -699,3 +699,265 @@ def _register_builtin_tools(reg: ToolRegistry) -> None:
         category="mesh",
     ))
 
+    # ------------------------------------------------------------------ #
+    # WEB TOOLS                                                            #
+    # ------------------------------------------------------------------ #
+
+    def _web_fetch(url: str, max_chars: int = 4000) -> ToolResult:
+        """Fetch a URL and return the text content."""
+        import urllib.request as _urllib  # noqa: PLC0415
+        import urllib.error as _urllib_err  # noqa: PLC0415
+        import html  # noqa: PLC0415
+        import re as _re  # noqa: PLC0415
+        try:
+            req = _urllib.Request(
+                url,
+                headers={"User-Agent": "AI-Helper/0.1 (+https://github.com/AI-Helper)"},
+            )
+            with _urllib.urlopen(req, timeout=15) as resp:  # noqa: S310
+                raw = resp.read().decode("utf-8", errors="replace")
+            # Strip HTML tags for readability
+            text = _re.sub(r"<[^>]+>", " ", raw)
+            text = html.unescape(text)
+            text = _re.sub(r"\s{2,}", " ", text).strip()
+            return _ok("web_fetch", text[:max_chars], data={"url": url, "length": len(text)})
+        except _urllib_err.HTTPError as exc:
+            return _err("web_fetch", f"HTTP {exc.code} {exc.reason} — {url}")
+        except Exception as exc:  # noqa: BLE001
+            return _err("web_fetch", str(exc))
+
+    reg.register(Tool(
+        name="web_fetch",
+        description="Fetch a URL and return its text content (HTML stripped).",
+        params=[
+            ToolParam("url", "str", "The URL to fetch."),
+            ToolParam("max_chars", "int", "Maximum characters to return (default 4000).",
+                      required=False, default=4000),
+        ],
+        handler=_web_fetch,
+        category="web",
+    ))
+
+    def _open_url(url: str) -> ToolResult:
+        """Open a URL in the system default browser."""
+        import webbrowser  # noqa: PLC0415
+        try:
+            webbrowser.open(url)
+            return _ok("open_url", f"Opened in browser: {url}", data={"url": url})
+        except Exception as exc:  # noqa: BLE001
+            return _err("open_url", str(exc))
+
+    reg.register(Tool(
+        name="open_url",
+        description="Open a URL in the system default web browser.",
+        params=[ToolParam("url", "str", "The URL to open.")],
+        handler=_open_url,
+        category="web",
+    ))
+
+    # ------------------------------------------------------------------ #
+    # VOICE TOOLS                                                          #
+    # ------------------------------------------------------------------ #
+
+    def _speak(text: str, rate: int = 0, volume: float = 0.0) -> ToolResult:
+        """Speak text aloud via the TTS engine."""
+        from .voice import Speaker  # noqa: PLC0415
+        speaker = Speaker()
+        if rate > 0:
+            speaker.set_rate(rate)
+        if 0.0 < volume <= 1.0:
+            speaker.set_volume(volume)
+        speaker.speak(text)
+        return _ok("speak", f"Speaking: {text[:80]}…" if len(text) > 80 else f"Speaking: {text}")
+
+    reg.register(Tool(
+        name="speak",
+        description="Speak text aloud using the system TTS engine (pyttsx3 or OS fallback).",
+        params=[
+            ToolParam("text", "str", "Text to speak."),
+            ToolParam("rate", "int", "Speech rate in words per minute (0 = default 175).",
+                      required=False, default=0),
+            ToolParam("volume", "float", "Volume 0.0–1.0 (0.0 = default).",
+                      required=False, default=0.0),
+        ],
+        handler=_speak,
+        category="voice",
+    ))
+
+    def _list_voices() -> ToolResult:
+        """List available TTS voices."""
+        from .voice import Speaker  # noqa: PLC0415
+        speaker = Speaker(enabled=False)
+        voices = speaker.list_voices()
+        if not voices:
+            return _ok("list_voices", "No pyttsx3 voices found (pyttsx3 may not be installed).", data=[])
+        text = "Available TTS voices:\n" + "\n".join(f"  {v}" for v in voices)
+        return _ok("list_voices", text, data=voices)
+
+    reg.register(Tool(
+        name="list_voices",
+        description="List all available text-to-speech voices on this system.",
+        params=[],
+        handler=_list_voices,
+        category="voice",
+    ))
+
+    def _set_voice(voice_id: str) -> ToolResult:
+        """Select a TTS voice by name fragment."""
+        from .voice import Speaker  # noqa: PLC0415
+        speaker = Speaker()
+        speaker.set_voice(voice_id)
+        return _ok("set_voice", f"Voice set to: {voice_id!r}")
+
+    reg.register(Tool(
+        name="set_voice",
+        description="Select a text-to-speech voice by name or id fragment (e.g. 'zira', 'david', 'daniel').",
+        params=[ToolParam("voice_id", "str", "Name or id fragment of the desired voice.")],
+        handler=_set_voice,
+        category="voice",
+    ))
+
+    # ------------------------------------------------------------------ #
+    # SCREENSHOT                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _screenshot(output_path: str = "") -> ToolResult:
+        """Take a screenshot and save it to disk."""
+        import time as _time  # noqa: PLC0415
+        from pathlib import Path as _Path  # noqa: PLC0415
+        from .config import get_data_dir  # noqa: PLC0415
+        if not output_path:
+            ts = _time.strftime("%Y%m%d_%H%M%S")
+            output_path = str(get_data_dir() / "screenshots" / f"screenshot_{ts}.png")
+        dest = _Path(output_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # Try PIL/Pillow ImageGrab first (Windows/macOS)
+            from PIL import ImageGrab  # noqa: PLC0415
+            img = ImageGrab.grab()
+            img.save(str(dest))
+            return _ok("screenshot", f"Screenshot saved: {dest}",
+                       data={"path": str(dest), "size": list(img.size)})
+        except ImportError:
+            pass
+        # Fallback: scrot (Linux)
+        import shutil as _shutil  # noqa: PLC0415
+        import subprocess as _subprocess  # noqa: PLC0415
+        if _shutil.which("scrot"):
+            _subprocess.run(["scrot", str(dest)], check=False, timeout=10)
+            if dest.exists():
+                return _ok("screenshot", f"Screenshot saved: {dest}", data={"path": str(dest)})
+        # Fallback: gnome-screenshot
+        if _shutil.which("gnome-screenshot"):
+            _subprocess.run(["gnome-screenshot", "-f", str(dest)], check=False, timeout=10)
+            if dest.exists():
+                return _ok("screenshot", f"Screenshot saved: {dest}", data={"path": str(dest)})
+        return _err("screenshot",
+                    "No screenshot tool available. Install Pillow (pip install Pillow) or scrot.")
+
+    reg.register(Tool(
+        name="screenshot",
+        description=(
+            "Take a screenshot of the current screen and save it to disk. "
+            "Requires Pillow (Windows/macOS) or scrot/gnome-screenshot (Linux)."
+        ),
+        params=[
+            ToolParam("output_path", "str",
+                      "Where to save the PNG. Defaults to AI-Helper/Data/screenshots/<timestamp>.png.",
+                      required=False, default=""),
+        ],
+        handler=_screenshot,
+        category="system",
+    ))
+
+    # ------------------------------------------------------------------ #
+    # CLIPBOARD TOOLS                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _clipboard_read() -> ToolResult:
+        """Read current clipboard contents."""
+        try:
+            import pyperclip  # noqa: PLC0415
+            text = pyperclip.paste() or ""
+            return _ok("clipboard_read", text or "(clipboard is empty)", data={"content": text})
+        except Exception as exc:  # noqa: BLE001
+            return _err("clipboard_read", f"Could not read clipboard: {exc}")
+
+    reg.register(Tool(
+        name="clipboard_read",
+        description="Read the current clipboard contents and return the text.",
+        params=[],
+        handler=_clipboard_read,
+        category="system",
+    ))
+
+    def _clipboard_write(text: str) -> ToolResult:
+        """Write text to the clipboard."""
+        try:
+            import pyperclip  # noqa: PLC0415
+            pyperclip.copy(text)
+            preview = text[:80] + "…" if len(text) > 80 else text
+            return _ok("clipboard_write", f"Copied to clipboard: {preview}")
+        except Exception as exc:  # noqa: BLE001
+            return _err("clipboard_write", f"Could not write clipboard: {exc}")
+
+    reg.register(Tool(
+        name="clipboard_write",
+        description="Write text to the system clipboard.",
+        params=[ToolParam("text", "str", "Text to copy to the clipboard.")],
+        handler=_clipboard_write,
+        category="system",
+    ))
+
+    # ------------------------------------------------------------------ #
+    # RESILIENCE / DIAGNOSTICS TOOLS                                       #
+    # ------------------------------------------------------------------ #
+
+    def _circuit_breaker_status() -> ToolResult:
+        """Show status of all AI service circuit breakers."""
+        try:
+            from .ai_integrations import _BREAKERS  # noqa: PLC0415
+            lines = ["Circuit breaker status for AI services:"]
+            for name, cb in _BREAKERS.items():
+                icon = "✓" if not cb.is_open else "✗ OPEN"
+                lines.append(
+                    f"  {name:<14} {icon}  (failures={cb._failure_count}/{cb.failure_threshold})"
+                )
+            return _ok("circuit_breaker_status", "\n".join(lines))
+        except Exception as exc:  # noqa: BLE001
+            return _err("circuit_breaker_status", str(exc))
+
+    reg.register(Tool(
+        name="circuit_breaker_status",
+        description="Show whether each AI service circuit breaker is open (failing fast) or closed (healthy).",
+        params=[],
+        handler=_circuit_breaker_status,
+        category="ai",
+    ))
+
+    def _reset_circuit_breaker(service: str) -> ToolResult:
+        """Manually close a circuit breaker for a service."""
+        try:
+            from .ai_integrations import _BREAKERS  # noqa: PLC0415
+            cb = _BREAKERS.get(service)
+            if cb is None:
+                valid = ", ".join(_BREAKERS)
+                return _err("reset_circuit_breaker",
+                            f"Unknown service {service!r}. Valid: {valid}")
+            cb.reset()
+            return _ok("reset_circuit_breaker", f"Circuit breaker for {service!r} reset to CLOSED.")
+        except Exception as exc:  # noqa: BLE001
+            return _err("reset_circuit_breaker", str(exc))
+
+    reg.register(Tool(
+        name="reset_circuit_breaker",
+        description="Manually close (reset) a circuit breaker for an AI service after it has recovered.",
+        params=[
+            ToolParam("service", "str",
+                      "Service name: ollama, lmstudio, comfyui, sdwebui, openwebui, "
+                      "localai, textgen, oobabooga, jan, llamacpp."),
+        ],
+        handler=_reset_circuit_breaker,
+        category="ai",
+    ))
+

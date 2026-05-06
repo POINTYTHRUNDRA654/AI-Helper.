@@ -151,6 +151,71 @@ class Speaker:
             except Exception:  # noqa: BLE001
                 pass
 
+    def clear(self) -> None:
+        """Alias for :meth:`stop` — discard queued speech immediately."""
+        self.stop()
+
+    @property
+    def is_speaking(self) -> bool:
+        """Return ``True`` if there are items waiting in the speech queue."""
+        return not self._queue.empty()
+
+    @property
+    def queue_size(self) -> int:
+        """Return the number of utterances currently queued."""
+        return self._queue.qsize()
+
+    def set_rate(self, rate: int) -> None:
+        """Change the speech rate (words per minute) on the fly."""
+        self.settings.rate = rate
+        if self._engine is not None:
+            try:
+                self._engine.setProperty("rate", rate)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def set_volume(self, volume: float) -> None:
+        """Change the speech volume (0.0–1.0) on the fly."""
+        self.settings.volume = max(0.0, min(1.0, volume))
+        if self._engine is not None:
+            try:
+                self._engine.setProperty("volume", self.settings.volume)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def set_voice(self, voice_id: str) -> None:
+        """Select a TTS voice by id or name fragment.
+
+        Matches the first pyttsx3 voice whose ``id`` or ``name`` contains
+        *voice_id* (case-insensitive).  Pass an empty string to reset to
+        the engine default.
+
+        Example::
+
+            speaker.set_voice("zira")   # Microsoft Zira (Windows)
+            speaker.set_voice("daniel") # macOS Daniel
+            speaker.set_voice("")       # engine default
+        """
+        if not voice_id:
+            self.settings.voice_id = None
+            return
+
+        if self._pyttsx3 is not None and self._engine is not None:
+            try:
+                voices = self._engine.getProperty("voices")
+                needle = voice_id.lower()
+                for v in voices:
+                    if needle in v.id.lower() or needle in v.name.lower():
+                        self._engine.setProperty("voice", v.id)
+                        self.settings.voice_id = v.id
+                        logger.info("TTS voice set to %r (%s)", v.name, v.id)
+                        return
+                logger.warning("No pyttsx3 voice matched %r; keeping current.", voice_id)
+            except Exception:  # noqa: BLE001
+                pass
+        # Fallback — store the id for the CLI backend
+        self.settings.voice_id = voice_id
+
     def shutdown(self) -> None:
         """Signal the worker thread to exit and wait for it."""
         self._queue.put(self._STOP)
