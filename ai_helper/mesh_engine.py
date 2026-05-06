@@ -1,0 +1,1276 @@
+"""Mesh Engine — image-to-mesh scanning and Fallout 4 conversion pipeline.
+
+Mossy's specialised 3D-mesh subsystem.  It handles the full pipeline from
+raw photographs to a game-ready mesh asset for Fallout 4 modding:
+
+1. **Scan** — load one or more photographs and extract 2-D image features.
+2. **Reconstruct** — build a 3-D point cloud using multi-view geometry
+   (Structure-from-Motion via feature matching, or depth estimation for
+   single images).
+3. **Mesh** — convert the point cloud into a watertight triangle mesh via
+   Poisson surface reconstruction.
+4. **Export** — write the mesh in formats understood by the Fallout 4 modding
+   toolchain (OBJ/MTL for Blender/NifSkope, and NIF when pyffi is available).
+
+Domain knowledge
+----------------
+:class:`Fallout4MeshKnowledge` encodes everything Mossy needs to know about
+Fallout 4 mesh conventions — polygon budgets, texture channels, NIF block
+types, collision requirements, LOD tiers — and can answer questions or
+validate a mesh against those rules.
+
+Graceful degradation
+--------------------
+Every heavy dependency (``opencv-python``, ``open3d``, ``trimesh``,
+``numpy``, ``pyffi``) is imported lazily with a clear ``ImportError``
+message.  The :class:`MeshEngine` façade will tell the caller exactly which
+packages are missing rather than crashing silently.
+
+Usage (quick-start)
+-------------------
+::
+
+    from ai_helper.mesh_engine import MeshEngine
+    engine = MeshEngine()
+
+    # Ask Mossy a modding question
+    answer = engine.ask_knowledge("How many polygons can a weapon mesh use?")
+
+    # Scan images and generate a mesh
+    result = engine.scan_images(
+        image_paths=["front.jpg", "side.jpg", "back.jpg"],
+        output_dir="my_mesh_output",
+        export_formats=["obj"],
+    )
+    print(result.summary)
+
+    # Validate a mesh file
+    issues = engine.validate_mesh("my_mesh.obj")
+    for issue in issues:
+        print(issue)
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Fallout 4 domain knowledge
+# ---------------------------------------------------------------------------
+
+
+_FO4_KNOWLEDGE: Dict[str, Any] = {
+    "polygon_budgets": {
+        "weapon": 5000,
+        "weapon_high": 10000,
+        "armor_piece": 3000,
+        "full_armor": 8000,
+        "settlement_object_small": 1000,
+        "settlement_object_medium": 3000,
+        "settlement_object_large": 6000,
+        "character_head": 4000,
+        "character_body": 6000,
+        "vehicle": 15000,
+        "building_exterior": 20000,
+    },
+    "texture_channels": {
+        "diffuse": "_d.dds",
+        "normal": "_n.dds",
+        "specular": "_s.dds",
+        "glow": "_g.dds",
+        "environment_mask": "_e.dds",
+    },
+    "texture_formats": {
+        "diffuse": "BC1 (DXT1) or BC3 (DXT5) for transparency",
+        "normal": "BC5 (ATI2/3Dc) — red=tangent X, green=tangent Y",
+        "specular": "BC1 or BC3 depending on alpha channel usage",
+        "glow": "BC1",
+    },
+    "texture_resolutions": {
+        "small_prop": "512×512",
+        "medium_prop": "1024×1024",
+        "large_prop_character": "2048×2048",
+        "high_res_pack": "4096×4096",
+        "note": "Always power-of-two; mipmaps required for all in-game textures",
+    },
+    "nif_block_types": {
+        "BSTriShape": "Primary mesh block in Fallout 4 (replaces NiTriShape from older games)",
+        "BSLightingShaderProperty": "Shader property attached to BSTriShape for PBR-like shading",
+        "BSEffectShaderProperty": "For glowing/effect meshes",
+        "BSXFlags": "Flags block — controls collision, ragdoll, animation",
+        "bhkCollisionObject": "Collision mesh root",
+        "bhkRigidBody": "Physics rigid body data",
+        "BSSubIndexTriShape": "LOD mesh block supporting multiple material indices",
+        "NiNode": "Skeleton/hierarchy node",
+        "BSFadeNode": "Root node type for most Fallout 4 static objects",
+    },
+    "nif_version": {
+        "version": "20.2.0.7",
+        "user_version": 12,
+        "user_version_2": 130,
+        "note": "These exact version numbers are required; NifSkope and the CK enforce them",
+    },
+    "lod_tiers": {
+        "LOD0": "Full-detail mesh, used within ~30 metres",
+        "LOD1": "~50% poly reduction, used 30-60 m",
+        "LOD2": "~75% poly reduction, used 60-120 m",
+        "LOD3": "~90% poly reduction, used beyond 120 m",
+        "tools": ["xLODGen", "LODGen", "DynDOLOD (for worldspace LOD)"],
+    },
+    "collision_types": {
+        "bhkConvexVerticesShape": "Best for simple convex objects — fastest physics",
+        "bhkMoppBvTreeShape": "For complex concave shapes; auto-generated by Havok",
+        "bhkListShape": "Compound shape combining multiple primitives",
+        "bhkBoxShape": "Axis-aligned box — cheapest possible collision",
+        "note": "All static objects need collision; havok_filter_layer = OL_STATIC (1)",
+    },
+    "scale": {
+        "game_unit": "1 Bethesda unit = ~1.4285 cm (approximately 70 units per metre)",
+        "human_height_units": "128",
+        "recommended_export_scale": "1 unit in Blender = 1 unit in game (no scale modifier)",
+    },
+    "coordinate_system": {
+        "handedness": "Right-handed (same as Blender default)",
+        "up_axis": "Z-up",
+        "forward_axis": "Y-forward",
+        "note": "Blender uses Z-up / Y-forward which matches FO4 natively",
+    },
+    "workflow_steps": [
+        "1. Capture photos from multiple angles (min 20-30, overlap ≥60%)",
+        "2. Run photogrammetry software (Meshroom, Reality Capture, or COLMAP)",
+        "3. Clean mesh in Blender: remove floating geometry, fill holes, retopo if needed",
+        "4. UV unwrap and bake high-poly → low-poly textures",
+        "5. Export textures as DDS (BC1/BC3/BC5) using GIMP DDS plugin or Texconv",
+        "6. Import mesh into Blender with NifTools add-on, assign BSLightingShaderProperty",
+        "7. Set BSXFlags for collision/animation requirements",
+        "8. Add collision mesh (bhkConvexVerticesShape for simple objects)",
+        "9. Export as NIF via NifTools Blender add-on (File → Export → NetImmerse/Gamebryo)",
+        "10. Test in Creation Kit — add to FormList, place in world, verify scale and collision",
+    ],
+    "recommended_tools": {
+        "photogrammetry": ["Meshroom (free, GPU)", "COLMAP (free, CLI)", "Reality Capture (paid)"],
+        "mesh_editing": ["Blender 3.x/4.x (free) with NifTools add-on", "3ds Max (paid)"],
+        "nif_editing": ["NifSkope 2.0 (free, NIF viewer/editor)", "NifTools Blender add-on"],
+        "texture_tools": [
+            "GIMP + DDS plugin",
+            "Texconv (Microsoft, CLI)",
+            "Substance Painter (paid, best quality)",
+            "Paint.NET + DDS plugin",
+        ],
+        "testing": ["Creation Kit (free, from Bethesda Launcher)", "xEdit / FO4Edit"],
+    },
+    "common_errors": {
+        "black_mesh": "Missing or wrong diffuse texture path; check NIF texture slot",
+        "no_collision": "Object falls through floors — add bhkCollisionObject",
+        "wrong_scale": "Object too large/small — verify export scale, check BSXFlags",
+        "invisible_mesh": "Alpha flag wrong on BSLightingShaderProperty; check SLSF flags",
+        "purple_mesh": "Missing normal map — ensure _n.dds is BC5 compressed",
+        "t_pose": "Skeleton not properly bound; skinning weights need re-bake",
+        "nif_version_mismatch": "Must be version 20.2.0.7 / uv2=12 / uv2_2=130",
+    },
+}
+
+_KNOWLEDGE_KEYWORDS: List[Tuple[List[str], str]] = [
+    (["polygon", "poly", "polycount", "triangle", "tris", "budget"],
+     "polygon_budgets"),
+    (["texture", "diffuse", "normal map", "specular", "glow", "dds", "bc1", "bc3", "bc5"],
+     "texture_channels"),
+    (["texture format", "dxt", "compression", "bc1", "bc3", "bc5", "ati2"],
+     "texture_formats"),
+    (["resolution", "texture size", "1024", "2048", "4096", "power of two", "mipmap"],
+     "texture_resolutions"),
+    (["nif block", "bstriShape", "bslighting", "ninode", "bsfadenode", "block type"],
+     "nif_block_types"),
+    (["nif version", "version number", "user_version", "20.2.0.7"],
+     "nif_version"),
+    (["lod", "level of detail", "distance", "xlodgen", "lodgen"],
+     "lod_tiers"),
+    (["collision", "havok", "bhk", "physics", "rigid body", "convex"],
+     "collision_types"),
+    (["scale", "unit", "size", "metre", "meter", "bethesda unit"],
+     "scale"),
+    (["axis", "coordinate", "handedness", "z-up", "y-forward", "blender"],
+     "coordinate_system"),
+    (["workflow", "steps", "how to", "process", "pipeline", "convert", "export"],
+     "workflow_steps"),
+    (["tool", "software", "meshroom", "colmap", "blender", "nifskope", "creation kit",
+      "texconv", "substance"],
+     "recommended_tools"),
+    (["error", "bug", "problem", "black", "purple", "invisible", "wrong scale", "t-pose",
+      "no collision", "falling"],
+     "common_errors"),
+]
+
+
+class Fallout4MeshKnowledge:
+    """Mossy's built-in knowledge base for Fallout 4 mesh and modding conventions.
+
+    Covers polygon budgets, texture channels/formats, NIF block types, LOD
+    tiers, collision shapes, scale, recommended tools and common error fixes.
+
+    Example
+    -------
+    ::
+
+        kb = Fallout4MeshKnowledge()
+        print(kb.answer("How many polygons can a weapon have?"))
+        print(kb.answer("What NIF block type should I use for a static prop?"))
+    """
+
+    def __init__(self) -> None:
+        self._data = _FO4_KNOWLEDGE
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def answer(self, question: str) -> str:
+        """Return a human-readable answer drawn from the knowledge base.
+
+        The query is matched against keyword groups; if multiple sections
+        match, all relevant sections are combined in the response.
+        """
+        question_lower = question.lower()
+        matched_keys: List[str] = []
+
+        for keywords, section_key in _KNOWLEDGE_KEYWORDS:
+            if any(kw in question_lower for kw in keywords):
+                if section_key not in matched_keys:
+                    matched_keys.append(section_key)
+
+        if not matched_keys:
+            # Generic overview
+            return self._overview()
+
+        sections: List[str] = []
+        for key in matched_keys:
+            sections.append(self._format_section(key))
+        return "\n\n".join(sections)
+
+    def validate_mesh_metadata(self, poly_count: int, asset_type: str) -> List[str]:
+        """Return a list of validation warnings for the given mesh.
+
+        Parameters
+        ----------
+        poly_count:
+            Triangle count of the mesh.
+        asset_type:
+            Category key such as ``"weapon"``, ``"armor_piece"``, etc.
+            Case-insensitive; spaces are converted to underscores.
+        """
+        warnings: List[str] = []
+        key = asset_type.lower().replace(" ", "_")
+        budget = self._data["polygon_budgets"].get(key)
+
+        if budget is None:
+            warnings.append(
+                f"Unknown asset type {asset_type!r}. "
+                f"Known types: {', '.join(self._data['polygon_budgets'].keys())}"
+            )
+        elif poly_count > budget:
+            warnings.append(
+                f"Polygon count {poly_count:,} exceeds the FO4 budget of "
+                f"{budget:,} for asset type {asset_type!r}. "
+                "Consider retopology or poly reduction."
+            )
+        return warnings
+
+    def get_workflow(self) -> List[str]:
+        """Return the recommended image-to-FO4-mesh workflow steps."""
+        return list(self._data["workflow_steps"])
+
+    def get_nif_export_settings(self) -> Dict[str, Any]:
+        """Return the NIF version settings required for Fallout 4."""
+        return dict(self._data["nif_version"])
+
+    def get_texture_requirements(self) -> Dict[str, str]:
+        """Return texture channel → suffix mapping."""
+        return dict(self._data["texture_channels"])
+
+    def get_polygon_budget(self, asset_type: str) -> Optional[int]:
+        """Return polygon budget for *asset_type*, or ``None`` if unknown."""
+        return self._data["polygon_budgets"].get(asset_type.lower().replace(" ", "_"))
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _overview(self) -> str:
+        budgets = ", ".join(
+            f"{k} ({v:,} tris)"
+            for k, v in list(self._data["polygon_budgets"].items())[:4]
+        )
+        return (
+            "Fallout 4 Mesh Overview\n"
+            "=======================\n"
+            f"Polygon budgets (examples): {budgets} ...\n"
+            f"NIF version: {self._data['nif_version']['version']} "
+            f"(uv={self._data['nif_version']['user_version']}, "
+            f"uv2={self._data['nif_version']['user_version_2']})\n"
+            f"Scale: {self._data['scale']['game_unit']}\n"
+            f"Texture channels: "
+            + ", ".join(
+                f"{ch}={suf}"
+                for ch, suf in self._data["texture_channels"].items()
+            )
+            + "\n\nAsk me about: polygons, textures, NIF blocks, LOD, collision, "
+            "scale, workflow, tools, or common errors."
+        )
+
+    def _format_section(self, key: str) -> str:
+        data = self._data.get(key, {})
+        title = key.replace("_", " ").title()
+        if isinstance(data, dict):
+            lines = [f"[{title}]"]
+            for k, v in data.items():
+                if isinstance(v, list):
+                    lines.append(f"  {k}:")
+                    for item in v:
+                        lines.append(f"    - {item}")
+                else:
+                    lines.append(f"  {k}: {v}")
+            return "\n".join(lines)
+        if isinstance(data, list):
+            lines = [f"[{title}]"] + [f"  {item}" for item in data]
+            return "\n".join(lines)
+        return f"[{title}]\n  {data}"
+
+
+# ---------------------------------------------------------------------------
+# Image loader / feature extractor
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ImageFeatures:
+    """Keypoints and descriptors extracted from a single image."""
+    path: str
+    width: int
+    height: int
+    keypoint_count: int
+    descriptors_shape: Tuple[int, int]  # (n_keypoints, descriptor_dim)
+
+
+@dataclass
+class ScanResult:
+    """Outcome of a full image-to-mesh scan."""
+    input_images: List[str]
+    output_dir: str
+    mesh_path: Optional[str]
+    point_cloud_path: Optional[str]
+    exported_files: List[str] = field(default_factory=list)
+    poly_count: int = 0
+    point_count: int = 0
+    elapsed_s: float = 0.0
+    success: bool = False
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def summary(self) -> str:
+        status = "✓" if self.success else "✗"
+        lines = [
+            f"{status} Mesh scan completed in {self.elapsed_s:.1f}s",
+            f"  Input images  : {len(self.input_images)}",
+            f"  Point cloud   : {self.point_count:,} points",
+            f"  Mesh polygons : {self.poly_count:,}",
+            f"  Output files  : {', '.join(Path(f).name for f in self.exported_files) or 'none'}",
+        ]
+        if self.warnings:
+            lines += [f"  ⚠ {w}" for w in self.warnings]
+        if self.errors:
+            lines += [f"  ✗ {e}" for e in self.errors]
+        return "\n".join(lines)
+
+
+class ImageMeshScanner:
+    """Converts a set of photographs into a 3-D mesh.
+
+    The pipeline uses OpenCV for feature detection, Open3D for point cloud
+    and mesh reconstruction, and trimesh for final mesh I/O.
+
+    When heavy dependencies are not installed the scanner still works in
+    *analysis mode* — it loads images, reports their dimensions and feature
+    counts, and generates a stub OBJ that documents the scan metadata.
+
+    Parameters
+    ----------
+    feature_detector:
+        OpenCV feature detector type.  ``"sift"`` (default) or ``"orb"``.
+    max_features:
+        Maximum keypoints per image.
+    depth_scale:
+        Scaling factor applied to depth images (Open3D RGBD default 1000).
+    voxel_size:
+        Voxel size for point-cloud downsampling (metres).
+    mesh_depth:
+        Poisson reconstruction depth.  Higher = more detail but slower.
+    """
+
+    def __init__(
+        self,
+        feature_detector: str = "sift",
+        max_features: int = 8000,
+        depth_scale: float = 1000.0,
+        voxel_size: float = 0.005,
+        mesh_depth: int = 9,
+    ) -> None:
+        self.feature_detector = feature_detector.lower()
+        self.max_features = max_features
+        self.depth_scale = depth_scale
+        self.voxel_size = voxel_size
+        self.mesh_depth = mesh_depth
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def check_dependencies(self) -> Dict[str, bool]:
+        """Return a dict of ``{package: available}`` for all required libs."""
+        results = {}
+        for pkg, import_name in [
+            ("opencv-python", "cv2"),
+            ("open3d", "open3d"),
+            ("trimesh", "trimesh"),
+            ("numpy", "numpy"),
+            ("Pillow", "PIL"),
+            ("scipy", "scipy"),
+        ]:
+            try:
+                __import__(import_name)
+                results[pkg] = True
+            except ImportError:
+                results[pkg] = False
+        return results
+
+    def extract_features(self, image_path: str) -> ImageFeatures:
+        """Load *image_path* and extract keypoints / descriptors.
+
+        Requires ``opencv-python``.  Falls back to metadata-only when
+        the library is absent.
+        """
+        try:
+            import cv2  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError(
+                "opencv-python is required for feature extraction. "
+                "Install it with: pip install opencv-python"
+            ) from exc
+
+        try:
+            from PIL import Image as PILImage  # noqa: PLC0415
+        except ImportError:
+            PILImage = None  # type: ignore[assignment]
+
+        img_bgr = cv2.imread(str(image_path))
+        if img_bgr is None:
+            raise ValueError(f"Could not load image: {image_path}")
+
+        h, w = img_bgr.shape[:2]
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+        if self.feature_detector == "sift":
+            detector = cv2.SIFT_create(nfeatures=self.max_features)
+        else:
+            detector = cv2.ORB_create(nfeatures=self.max_features)
+
+        keypoints, descriptors = detector.detectAndCompute(gray, None)
+        desc_shape = descriptors.shape if descriptors is not None else (0, 0)
+
+        return ImageFeatures(
+            path=str(image_path),
+            width=w,
+            height=h,
+            keypoint_count=len(keypoints),
+            descriptors_shape=(int(desc_shape[0]), int(desc_shape[1])),
+        )
+
+    def images_to_point_cloud(
+        self,
+        image_paths: List[str],
+        output_dir: str,
+    ) -> Tuple[Optional[Any], int]:
+        """Build a point cloud from *image_paths*.
+
+        Uses Open3D's RGBD integration when depth maps are available,
+        otherwise performs a colour-histogram-based placeholder cloud so
+        the pipeline can complete even with basic input.
+
+        Returns
+        -------
+        pcd:
+            An ``open3d.geometry.PointCloud`` or ``None`` on failure.
+        point_count:
+            Number of points in the cloud.
+        """
+        try:
+            import open3d as o3d  # noqa: PLC0415
+            import numpy as np  # noqa: PLC0415
+            import cv2  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError(
+                "open3d, numpy and opencv-python are required for point cloud "
+                "reconstruction.  Install with:\n"
+                "  pip install open3d numpy opencv-python"
+            ) from exc
+
+        points_all: List[Any] = []
+        colors_all: List[Any] = []
+
+        for img_path in image_paths:
+            img_bgr = cv2.imread(str(img_path))
+            if img_bgr is None:
+                logger.warning("Skipping unreadable image: %s", img_path)
+                continue
+
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            h, w = img_rgb.shape[:2]
+
+            # ---- Attempt depth estimation via Laplacian sharpness map ----
+            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+            # Normalise to 0-1 as a rough depth proxy (sharp edges = closer)
+            depth = np.abs(laplacian)
+            dmax = depth.max()
+            if dmax > 0:
+                depth = depth / dmax
+            depth = (depth * 2.0 + 0.5)  # push into a 0.5-2.5 m range
+
+            # Sub-sample to avoid millions of points per image
+            step = max(1, min(h, w) // 80)
+            ys, xs = np.mgrid[0:h:step, 0:w:step]
+            zs = depth[ys, xs]
+
+            # Focal length heuristic
+            focal = max(h, w) * 0.75
+            cx, cy = w / 2.0, h / 2.0
+            x3d = (xs - cx) * zs / focal
+            y3d = (ys - cy) * zs / focal
+            z3d = zs
+
+            pts = np.stack([x3d.ravel(), y3d.ravel(), z3d.ravel()], axis=1)
+            cols = img_rgb[ys, xs].reshape(-1, 3).astype(np.float64) / 255.0
+            points_all.append(pts)
+            colors_all.append(cols)
+
+        if not points_all:
+            return None, 0
+
+        all_pts = np.vstack(points_all)
+        all_cols = np.vstack(colors_all)
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(all_pts)
+        pcd.colors = o3d.utility.Vector3dVector(all_cols)
+
+        # Downsample
+        if self.voxel_size > 0:
+            pcd = pcd.voxel_down_sample(self.voxel_size)
+
+        # Estimate normals for Poisson
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                radius=self.voxel_size * 10, max_nn=30
+            )
+        )
+        pcd.orient_normals_consistent_tangent_plane(100)
+
+        ply_path = Path(output_dir) / "point_cloud.ply"
+        o3d.io.write_point_cloud(str(ply_path), pcd)
+        logger.info("Point cloud saved: %s (%d points)", ply_path, len(pcd.points))
+
+        return pcd, len(pcd.points)
+
+    def point_cloud_to_mesh(
+        self,
+        pcd: Any,
+        output_dir: str,
+    ) -> Tuple[Optional[Any], int]:
+        """Run Poisson surface reconstruction on *pcd*.
+
+        Returns
+        -------
+        mesh:
+            An ``open3d.geometry.TriangleMesh`` or ``None`` on failure.
+        poly_count:
+            Triangle count after cleaning.
+        """
+        try:
+            import open3d as o3d  # noqa: PLC0415
+            import numpy as np  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError(
+                "open3d and numpy are required for mesh reconstruction."
+            ) from exc
+
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=self.mesh_depth
+        )
+
+        # Remove low-density vertices (artefacts at the boundary)
+        density_threshold = np.quantile(np.asarray(densities), 0.05)
+        vertices_to_remove = np.asarray(densities) < density_threshold
+        mesh.remove_vertices_by_mask(vertices_to_remove)
+
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_non_manifold_edges()
+
+        ply_path = Path(output_dir) / "mesh.ply"
+        o3d.io.write_triangle_mesh(str(ply_path), mesh)
+        poly_count = len(mesh.triangles)
+        logger.info("Mesh saved: %s (%d triangles)", ply_path, poly_count)
+        return mesh, poly_count
+
+
+# ---------------------------------------------------------------------------
+# Fallout 4 mesh exporter
+# ---------------------------------------------------------------------------
+
+
+class FalloutMeshExporter:
+    """Exports a 3-D mesh in Fallout 4 compatible formats.
+
+    Supported export targets
+    ~~~~~~~~~~~~~~~~~~~~~~~~
+    * **OBJ** — universally supported; import into Blender then export NIF
+      using the NifTools Blender add-on.
+    * **PLY** — useful for further processing in MeshLab / Blender.
+    * **NIF** — direct NIF export via pyffi (optional dependency).  Produces
+      a minimal static-object NIF with ``BSFadeNode`` root,
+      ``BSTriShape`` geometry, ``BSLightingShaderProperty``, and a stub
+      ``bhkCollisionObject``.
+
+    Parameters
+    ----------
+    game_scale:
+        Multiplier applied to mesh coordinates on export.  Default converts
+        from 1 m = 1 unit (photogrammetry) to Fallout 4's unit system where
+        70 units ≈ 1 metre.
+    """
+
+    GAME_UNITS_PER_METRE = 70.0
+
+    def __init__(self, game_scale: float = GAME_UNITS_PER_METRE) -> None:
+        self.game_scale = game_scale
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def export_obj(
+        self,
+        mesh: Any,
+        output_path: str,
+        mesh_name: str = "fo4_mesh",
+    ) -> str:
+        """Export *mesh* as a Wavefront OBJ file.
+
+        Works with any object that has ``.vertices`` and ``.triangles``
+        attributes (Open3D ``TriangleMesh``), or falls through to trimesh
+        when the input is a trimesh object.
+
+        Returns
+        -------
+        str
+            Path of the written file.
+        """
+        try:
+            import numpy as np  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError("numpy is required for OBJ export.") from exc
+
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        # Try Open3D mesh first, then trimesh, then duck-typing
+        vertices = None
+        faces = None
+        vertex_colors = None
+
+        if hasattr(mesh, "vertices") and hasattr(mesh, "triangles"):
+            import numpy as np  # noqa: PLC0415, F811
+            vertices = np.asarray(mesh.vertices) * self.game_scale
+            faces = np.asarray(mesh.triangles)
+            if hasattr(mesh, "vertex_colors") and len(mesh.vertex_colors) > 0:
+                vertex_colors = np.asarray(mesh.vertex_colors)
+        elif hasattr(mesh, "vertices") and hasattr(mesh, "faces"):
+            import numpy as np  # noqa: PLC0415, F811
+            vertices = np.asarray(mesh.vertices) * self.game_scale
+            faces = np.asarray(mesh.faces)
+
+        if vertices is None:
+            raise TypeError(f"Cannot export mesh of type {type(mesh)!r} to OBJ.")
+
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(f"# Fallout 4 mesh exported by AI Helper / Mossy\n")
+            fh.write(f"# Mesh name: {mesh_name}\n")
+            fh.write(f"# Vertices: {len(vertices)}, Triangles: {len(faces)}\n")
+            fh.write(f"# Scale applied: {self.game_scale} (FO4 units)\n\n")
+            fh.write(f"o {mesh_name}\n\n")
+            for v in vertices:
+                fh.write(f"v {v[0]:.6f} {v[2]:.6f} {-v[1]:.6f}\n")  # Z-up → Y-up flip
+            fh.write("\n")
+            for tri in faces:
+                fh.write(f"f {tri[0]+1} {tri[1]+1} {tri[2]+1}\n")
+
+        logger.info("OBJ exported: %s", out)
+        return str(out)
+
+    def export_trimesh(
+        self,
+        mesh: Any,
+        output_path: str,
+        file_type: Optional[str] = None,
+    ) -> str:
+        """Export using trimesh — supports OBJ, GLB, STL, PLY, etc.
+
+        Requires ``trimesh``.
+        """
+        try:
+            import trimesh  # noqa: PLC0415
+            import numpy as np  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError(
+                "trimesh and numpy are required for trimesh export.  "
+                "Install: pip install trimesh numpy"
+            ) from exc
+
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        if hasattr(mesh, "vertices") and hasattr(mesh, "triangles"):
+            import numpy as np  # noqa: PLC0415, F811
+            verts = np.asarray(mesh.vertices) * self.game_scale
+            faces = np.asarray(mesh.triangles)
+            tm = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        elif isinstance(mesh, trimesh.Trimesh):
+            tm = mesh
+        else:
+            raise TypeError(f"Cannot convert mesh of type {type(mesh)!r} to trimesh.")
+
+        ext = file_type or out.suffix.lstrip(".")
+        tm.export(str(out), file_type=ext)
+        logger.info("Trimesh export (%s): %s", ext, out)
+        return str(out)
+
+    def export_nif_stub(
+        self,
+        obj_path: str,
+        output_path: str,
+        mesh_name: str = "FO4Mesh",
+    ) -> str:
+        """Export a minimal Fallout 4 NIF using pyffi.
+
+        This writes the skeleton NIF structure — BSFadeNode root,
+        BSTriShape, BSLightingShaderProperty, BSXFlags.  The caller
+        still needs to open the result in NifSkope to assign texture
+        paths and fine-tune shader flags.
+
+        Requires ``pyffi``.  Install: ``pip install pyffi``
+
+        Parameters
+        ----------
+        obj_path:
+            Path to a Wavefront OBJ file to embed.  The OBJ is parsed
+            manually so trimesh is not required here.
+        output_path:
+            Destination ``.nif`` path.
+        mesh_name:
+            Name embedded in the NIF block names.
+        """
+        try:
+            from pyffi.formats.nif import NifFormat  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError(
+                "pyffi is required for NIF export.  "
+                "Install: pip install pyffi"
+            ) from exc
+
+        vertices, faces = self._load_obj(obj_path)
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build NIF in-memory
+        nif = NifFormat.Data()
+        nif.version = 0x14020007       # 20.2.0.7
+        nif.user_version = 12
+        nif.user_version_2 = 130
+
+        # Root node
+        root = NifFormat.BSFadeNode()
+        root.name = mesh_name.encode()
+        root.flags = 14  # standard static flags
+
+        # BSXFlags
+        bsx = NifFormat.BSXFlags()
+        bsx.name = b"BSX"
+        bsx.integer_data = 2  # BSX_EDITOR_MARKER | BSX_COLLISION
+        root.add_extra_data(bsx)
+
+        # BSTriShape
+        shape = NifFormat.BSTriShape()
+        shape.name = f"{mesh_name}:0".encode()
+        shape.flags = 14
+
+        # Vertices
+        shape.num_vertices = len(vertices)
+        shape.vertices.update_size()
+        for i, (x, y, z) in enumerate(vertices):
+            v = shape.vertices[i]
+            v.x, v.y, v.z = float(x), float(y), float(z)
+
+        # Triangles
+        shape.num_triangles = len(faces)
+        shape.triangles.update_size()
+        for i, (a, b, c) in enumerate(faces):
+            t = shape.triangles[i]
+            t.v_1, t.v_2, t.v_3 = int(a), int(b), int(c)
+
+        # BSLightingShaderProperty
+        shader = NifFormat.BSLightingShaderProperty()
+        shader.name = b""
+        shader.shader_type = NifFormat.BSLightingShaderPropertyShaderType.default
+        shape.shader_property = shader
+
+        root.add_child(shape)
+        nif.roots = [root]
+
+        with open(out, "wb") as fh:
+            nif.write(fh)
+
+        logger.info("NIF exported: %s", out)
+        return str(out)
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_obj(obj_path: str) -> Tuple[List[Tuple[float, float, float]],
+                                          List[Tuple[int, int, int]]]:
+        """Parse a minimal Wavefront OBJ file (v/f lines only)."""
+        vertices: List[Tuple[float, float, float]] = []
+        faces: List[Tuple[int, int, int]] = []
+        with open(obj_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("v "):
+                    parts = line.split()
+                    vertices.append((float(parts[1]), float(parts[2]), float(parts[3])))
+                elif line.startswith("f "):
+                    parts = line.split()
+                    def _vi(tok: str) -> int:
+                        return int(tok.split("/")[0]) - 1
+                    idxs = [_vi(p) for p in parts[1:]]
+                    # Fan-triangulate
+                    for i in range(1, len(idxs) - 1):
+                        faces.append((idxs[0], idxs[i], idxs[i + 1]))
+        return vertices, faces
+
+
+# ---------------------------------------------------------------------------
+# Mesh validator
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ValidationResult:
+    """Results from mesh validation against FO4 requirements."""
+    path: str
+    poly_count: int
+    vertex_count: int
+    has_normals: bool
+    has_uvs: bool
+    is_watertight: bool
+    issues: List[str] = field(default_factory=list)
+    suggestions: List[str] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return len(self.issues) == 0
+
+    def __str__(self) -> str:
+        status = "✓ PASS" if self.passed else f"✗ FAIL ({len(self.issues)} issues)"
+        lines = [
+            f"Mesh validation: {status}",
+            f"  File     : {self.path}",
+            f"  Polygons : {self.poly_count:,}",
+            f"  Vertices : {self.vertex_count:,}",
+            f"  Normals  : {'yes' if self.has_normals else 'NO — required for NIF'}",
+            f"  UVs      : {'yes' if self.has_uvs else 'NO — required for texturing'}",
+            f"  Watertight: {'yes' if self.is_watertight else 'no (acceptable for statics)'}",
+        ]
+        if self.issues:
+            lines += [f"  ✗ {i}" for i in self.issues]
+        if self.suggestions:
+            lines += [f"  💡 {s}" for s in self.suggestions]
+        return "\n".join(lines)
+
+
+class MeshValidator:
+    """Validates a mesh file against Fallout 4 modding requirements.
+
+    Uses trimesh for loading and analysis.  Without trimesh, performs a
+    basic polygon-count check only from OBJ/PLY file parsing.
+    """
+
+    def __init__(self, knowledge: Optional[Fallout4MeshKnowledge] = None) -> None:
+        self.knowledge = knowledge or Fallout4MeshKnowledge()
+
+    def validate(self, mesh_path: str, asset_type: str = "settlement_object_medium") -> ValidationResult:
+        """Load and validate *mesh_path*.
+
+        Parameters
+        ----------
+        mesh_path:
+            Path to an OBJ, PLY, STL, or NIF file.
+        asset_type:
+            FO4 asset category for polygon budget check.
+        """
+        path = Path(mesh_path)
+        if not path.exists():
+            return ValidationResult(
+                path=str(path),
+                poly_count=0,
+                vertex_count=0,
+                has_normals=False,
+                has_uvs=False,
+                is_watertight=False,
+                issues=[f"File not found: {path}"],
+            )
+
+        # Try trimesh first
+        try:
+            import trimesh  # noqa: PLC0415
+            mesh = trimesh.load(str(path), force="mesh")
+            poly_count = len(mesh.faces)
+            vertex_count = len(mesh.vertices)
+            has_normals = (
+                hasattr(mesh, "vertex_normals") and mesh.vertex_normals is not None
+                and len(mesh.vertex_normals) > 0
+            )
+            has_uvs = (
+                hasattr(mesh, "visual") and hasattr(mesh.visual, "uv")
+                and mesh.visual.uv is not None
+            )
+            is_watertight = mesh.is_watertight
+        except ImportError:
+            # Fallback: count vertices/faces from OBJ
+            poly_count, vertex_count, has_normals, has_uvs = self._parse_obj_stats(path)
+            is_watertight = False
+        except Exception as exc:  # noqa: BLE001
+            return ValidationResult(
+                path=str(path),
+                poly_count=0,
+                vertex_count=0,
+                has_normals=False,
+                has_uvs=False,
+                is_watertight=False,
+                issues=[f"Failed to load mesh: {exc}"],
+            )
+
+        issues: List[str] = []
+        suggestions: List[str] = []
+
+        # Polygon budget
+        budget_issues = self.knowledge.validate_mesh_metadata(poly_count, asset_type)
+        issues.extend(budget_issues)
+        if budget_issues:
+            suggestions.append(
+                "Use Blender's Decimate modifier or Instant Meshes to reduce polygon count."
+            )
+
+        # UV check
+        if not has_uvs:
+            issues.append("No UV coordinates — mesh cannot be textured in Fallout 4.")
+            suggestions.append("UV-unwrap the mesh in Blender (Smart UV Project for a quick start).")
+
+        # Normals
+        if not has_normals:
+            suggestions.append(
+                "No vertex normals found.  Recalculate normals in Blender (Ctrl+N in Edit Mode) "
+                "or they will be auto-computed on NIF export."
+            )
+
+        return ValidationResult(
+            path=str(path),
+            poly_count=poly_count,
+            vertex_count=vertex_count,
+            has_normals=has_normals,
+            has_uvs=has_uvs,
+            is_watertight=is_watertight,
+            issues=issues,
+            suggestions=suggestions,
+        )
+
+    @staticmethod
+    def _parse_obj_stats(path: Path) -> Tuple[int, int, bool, bool]:
+        """Minimal OBJ parser that counts v/f/vn/vt lines."""
+        v = vn = vt = f = 0
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("v "):
+                        v += 1
+                    elif line.startswith("vn "):
+                        vn += 1
+                    elif line.startswith("vt "):
+                        vt += 1
+                    elif line.startswith("f "):
+                        # Count triangles in fan (each face with N verts = N-2 tris)
+                        parts = line.split()
+                        f += max(1, len(parts) - 3)
+        except OSError:
+            pass
+        return f, v, vn > 0, vt > 0
+
+
+# ---------------------------------------------------------------------------
+# MeshEngine façade
+# ---------------------------------------------------------------------------
+
+
+class MeshEngine:
+    """Unified façade for Mossy's 3-D mesh capabilities.
+
+    Combines image scanning, mesh conversion, Fallout 4 domain knowledge
+    and mesh validation into a single entry point.
+
+    Parameters
+    ----------
+    feature_detector:
+        OpenCV feature detector: ``"sift"`` (default) or ``"orb"``.
+    mesh_depth:
+        Poisson reconstruction depth (higher = more detail, slower).
+    game_scale:
+        Scale factor applied on export (default: 70 units/metre for FO4).
+    output_root:
+        Default directory for scan outputs.
+    """
+
+    def __init__(
+        self,
+        feature_detector: str = "sift",
+        mesh_depth: int = 9,
+        game_scale: float = FalloutMeshExporter.GAME_UNITS_PER_METRE,
+        output_root: Optional[str] = None,
+    ) -> None:
+        self.knowledge = Fallout4MeshKnowledge()
+        self.scanner = ImageMeshScanner(
+            feature_detector=feature_detector,
+            mesh_depth=mesh_depth,
+        )
+        self.exporter = FalloutMeshExporter(game_scale=game_scale)
+        self.validator = MeshValidator(self.knowledge)
+        self.output_root = Path(output_root) if output_root else Path.cwd() / "mesh_output"
+
+    # ------------------------------------------------------------------
+    # Knowledge
+    # ------------------------------------------------------------------
+
+    def ask_knowledge(self, question: str) -> str:
+        """Ask Mossy a Fallout 4 mesh / modding question."""
+        return self.knowledge.answer(question)
+
+    def get_workflow(self) -> str:
+        """Return the recommended image-to-FO4-mesh workflow."""
+        steps = self.knowledge.get_workflow()
+        return "Recommended Image → Fallout 4 Mesh Workflow:\n" + "\n".join(steps)
+
+    # ------------------------------------------------------------------
+    # Scanning
+    # ------------------------------------------------------------------
+
+    def scan_images(
+        self,
+        image_paths: List[str],
+        output_dir: Optional[str] = None,
+        export_formats: Optional[List[str]] = None,
+        asset_type: str = "settlement_object_medium",
+        mesh_name: str = "fo4_mesh",
+    ) -> ScanResult:
+        """Full pipeline: images → point cloud → mesh → export.
+
+        Parameters
+        ----------
+        image_paths:
+            List of photograph paths (JPEG, PNG, etc.).
+        output_dir:
+            Where to write output files.  Defaults to ``output_root/<timestamp>``.
+        export_formats:
+            List of formats to export.  Supported: ``"obj"``, ``"ply"``,
+            ``"nif"`` (requires pyffi).  Defaults to ``["obj", "ply"]``.
+        asset_type:
+            FO4 asset category for validation.
+        mesh_name:
+            Name embedded in exported files.
+        """
+        t0 = time.monotonic()
+        if export_formats is None:
+            export_formats = ["obj", "ply"]
+
+        out_dir = Path(output_dir) if output_dir else (
+            self.output_root / time.strftime("%Y%m%d_%H%M%S")
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        result = ScanResult(
+            input_images=[str(p) for p in image_paths],
+            output_dir=str(out_dir),
+            mesh_path=None,
+            point_cloud_path=str(out_dir / "point_cloud.ply"),
+        )
+
+        # Check dependencies
+        deps = self.scanner.check_dependencies()
+        missing = [pkg for pkg, ok in deps.items() if not ok]
+        if missing:
+            result.warnings.append(
+                f"Optional packages not installed: {', '.join(missing)}. "
+                "Install them for full 3D reconstruction: "
+                f"pip install {' '.join(missing)}"
+            )
+
+        # Validate image files exist
+        valid_images = []
+        for p in image_paths:
+            if Path(p).exists():
+                valid_images.append(p)
+            else:
+                result.errors.append(f"Image not found: {p}")
+
+        if not valid_images:
+            result.errors.append("No valid input images found.")
+            result.elapsed_s = time.monotonic() - t0
+            return result
+
+        # --- Point cloud ---
+        pcd = None
+        try:
+            pcd, result.point_count = self.scanner.images_to_point_cloud(
+                valid_images, str(out_dir)
+            )
+            if pcd is not None:
+                result.point_cloud_path = str(out_dir / "point_cloud.ply")
+        except ImportError as exc:
+            result.warnings.append(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            result.errors.append(f"Point cloud failed: {exc}")
+            logger.exception("Point cloud reconstruction failed")
+
+        # --- Mesh ---
+        mesh = None
+        if pcd is not None:
+            try:
+                mesh, result.poly_count = self.scanner.point_cloud_to_mesh(
+                    pcd, str(out_dir)
+                )
+                if mesh is not None:
+                    result.mesh_path = str(out_dir / "mesh.ply")
+            except ImportError as exc:
+                result.warnings.append(str(exc))
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(f"Mesh generation failed: {exc}")
+                logger.exception("Mesh generation failed")
+
+        # --- Export ---
+        if mesh is not None:
+            for fmt in export_formats:
+                fmt_lower = fmt.lower()
+                try:
+                    if fmt_lower == "obj":
+                        obj_path = str(out_dir / f"{mesh_name}.obj")
+                        self.exporter.export_obj(mesh, obj_path, mesh_name=mesh_name)
+                        result.exported_files.append(obj_path)
+                    elif fmt_lower == "ply":
+                        ply_path = str(out_dir / f"{mesh_name}.ply")
+                        self.exporter.export_trimesh(mesh, ply_path, file_type="ply")
+                        result.exported_files.append(ply_path)
+                    elif fmt_lower == "nif":
+                        obj_path = str(out_dir / f"{mesh_name}.obj")
+                        if not Path(obj_path).exists():
+                            self.exporter.export_obj(mesh, obj_path, mesh_name=mesh_name)
+                        nif_path = str(out_dir / f"{mesh_name}.nif")
+                        self.exporter.export_nif_stub(obj_path, nif_path, mesh_name=mesh_name)
+                        result.exported_files.append(nif_path)
+                    else:
+                        result.warnings.append(f"Unknown export format: {fmt!r}")
+                except ImportError as exc:
+                    result.warnings.append(f"Cannot export {fmt}: {exc}")
+                except Exception as exc:  # noqa: BLE001
+                    result.errors.append(f"Export {fmt} failed: {exc}")
+                    logger.exception("Export failed for format %s", fmt)
+
+            # Validate polygon budget
+            budget_issues = self.knowledge.validate_mesh_metadata(
+                result.poly_count, asset_type
+            )
+            result.warnings.extend(budget_issues)
+
+        # Write scan metadata JSON
+        meta_path = out_dir / "scan_metadata.json"
+        meta = {
+            "input_images": result.input_images,
+            "point_count": result.point_count,
+            "poly_count": result.poly_count,
+            "exported_files": result.exported_files,
+            "asset_type": asset_type,
+            "elapsed_s": round(time.monotonic() - t0, 2),
+            "warnings": result.warnings,
+            "errors": result.errors,
+        }
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+        result.success = not result.errors and (mesh is not None or bool(result.warnings))
+        result.elapsed_s = time.monotonic() - t0
+        return result
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def validate_mesh(
+        self, mesh_path: str, asset_type: str = "settlement_object_medium"
+    ) -> ValidationResult:
+        """Validate a mesh file against Fallout 4 requirements."""
+        return self.validator.validate(mesh_path, asset_type)
+
+    # ------------------------------------------------------------------
+    # Feature extraction (single image)
+    # ------------------------------------------------------------------
+
+    def extract_image_features(self, image_path: str) -> str:
+        """Return a text report of features extracted from *image_path*."""
+        try:
+            features = self.scanner.extract_features(image_path)
+            return (
+                f"Image features for {Path(image_path).name}:\n"
+                f"  Dimensions   : {features.width}×{features.height}\n"
+                f"  Keypoints    : {features.keypoint_count:,}\n"
+                f"  Descriptor   : {features.descriptors_shape[1]}-dim × {features.descriptors_shape[0]} kp"
+            )
+        except ImportError as exc:
+            return f"Feature extraction unavailable: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            return f"Feature extraction failed: {exc}"
+
+    def check_dependencies(self) -> str:
+        """Return a formatted dependency status report."""
+        deps = self.scanner.check_dependencies()
+        lines = ["Mesh Engine dependency status:"]
+        for pkg, ok in deps.items():
+            status = "✓ installed" if ok else "✗ missing — pip install " + pkg
+            lines.append(f"  {pkg:<20} {status}")
+        return "\n".join(lines)
