@@ -38,7 +38,6 @@ import platform
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)

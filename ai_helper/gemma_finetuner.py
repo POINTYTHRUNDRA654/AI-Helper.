@@ -47,7 +47,6 @@ Quick-start: fine-tune Mossy on modding conversations
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from dataclasses import dataclass, field, asdict

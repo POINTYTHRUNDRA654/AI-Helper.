@@ -239,9 +239,12 @@ class MeshyClient:
             logger.warning("Meshy task %s has no %r download URL.", task.task_id, fmt)
             return None
 
-        # Validate that the URL is from a Meshy domain to prevent SSRF
+        # Validate that the URL is from a Meshy domain to prevent SSRF.
+        # Use exact equality or a leading-dot subdomain check — never a
+        # substring check, which would allow domains like "fakemeshy.ai".
         parsed_url = urllib.parse.urlparse(url)
-        if "meshy.ai" not in parsed_url.netloc and not parsed_url.netloc.endswith(".meshy.ai"):
+        netloc = parsed_url.netloc.lower()
+        if netloc != "meshy.ai" and not netloc.endswith(".meshy.ai"):
             logger.error(
                 "Meshy download URL has unexpected domain %r — refusing to fetch.",
                 parsed_url.netloc,

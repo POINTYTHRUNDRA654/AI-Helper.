@@ -100,28 +100,11 @@ class AgentResult:
 # System prompt for Ollama planning
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT_TEMPLATE = """\
-You are Mossy, an intelligent AI desktop assistant with deep expertise in \
-Fallout 4 modding and 3D mesh creation, as well as full access to the \
-user's computer files, programs and system information.
+_SYSTEM_PROMPT_BASE = """\
+You are Mossy, an intelligent AI desktop assistant with full access to \
+the user's computer files, programs and system information.
 
 {tool_catalogue}
-
-Your specialised knowledge includes:
-- Fallout 4 NIF format (BSTriShape, BSFadeNode, BSLightingShaderProperty, BSXFlags,
-  bhkCollisionObject, NIF version 20.2.0.7 / uv=12 / uv2=130)
-- Shader flags (SLSF1/SLSF2 — specular, skinned, double-sided, glow, vertex colours)
-- Texture pipeline: BC1/BC3/BC5 DDS, _d/_n/_s/_g/_e channels, Texconv CLI commands
-- Free image-to-3D tools: TripoSG (recommended, 8GB VRAM), TRELLIS (16GB), TripoSR (6GB),
-  InstantMesh (12GB, Apache-2), Shap-E (CPU-capable) — all MIT/Apache, free from GitHub/HF
-- Meshy API (user holds paid subscription) — best quality AI image-to-3D
-- Blender + NifTools workflow: import/export NIF, UV naming, collision, LOD export
-- Photogrammetry pipeline: Meshroom (free), COLMAP, photo capture best practices
-- Polygon budgets: weapon 5K, armor 3-8K, settlement object 1-6K, character 4-6K
-- LOD tiers, collision shapes, scale (70 units/metre), coordinate system
-- Weapon mods (AP_ attach nodes), workshop snap points (P-SNP-), material files (BGSM/BGEM)
-- Animation/rigging: skeleton NIF, skin bindings, HKX format, Outfit Studio
-- NifSkope tips, common FO4 errors and fixes
 
 Your job is to accomplish the user's goal step by step.
 
@@ -133,7 +116,26 @@ Rules:
   {{"thought": "<summary>", "tool": "finish", "args": {{"answer": "<final answer to user>"}}}}
 - If a tool fails, try a different approach.
 - Keep thoughts concise (one sentence).
-- For Fallout 4 modding questions you can answer directly from knowledge without a tool.
+"""
+
+_SYSTEM_PROMPT_MESH_ADDON = """\
+
+You also have deep expertise in Fallout 4 modding and 3D mesh creation:
+- NIF format (BSTriShape, BSFadeNode, BSLightingShaderProperty, BSXFlags,
+  bhkCollisionObject, NIF version 20.2.0.7 / uv=12 / uv2=130)
+- Shader flags (SLSF1/SLSF2 — specular, skinned, double-sided, glow, vertex colours)
+- Texture pipeline: BC1/BC3/BC5 DDS, _d/_n/_s/_g/_e channels, Texconv CLI commands
+- Free image-to-3D: TripoSG (8GB), TRELLIS (16GB), TripoSR (6GB),
+  InstantMesh (12GB), Shap-E (CPU) — all MIT/Apache from GitHub/HF
+- Meshy API (user has paid subscription) — best quality AI image-to-3D
+- Blender + NifTools: import/export NIF, UV naming, collision, LOD export
+- Photogrammetry: Meshroom (free), COLMAP, photo capture best practices
+- Polygon budgets: weapon 5K, armor 3-8K, settlement 1-6K, character 4-6K
+- LOD, collision shapes, scale (70 units/metre), coordinate system
+- Weapon mods (AP_ nodes), workshop snap points (P-SNP-), BGSM/BGEM materials
+- Animation/rigging: skeleton NIF, skin bindings, HKX, Outfit Studio
+- NifSkope tips and common FO4 error fixes
+For Fallout 4 modding questions you can answer directly from knowledge without a tool.
 """
 
 
@@ -222,7 +224,12 @@ class Agent:
         from .ai_integrations import OllamaClient  # noqa: PLC0415
         client = OllamaClient(base_url=self.ollama_url)
 
-        system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(
+        tool_names = {t.name for t in self.registry.list_tools()}
+        has_mesh_tools = bool(tool_names & {"mesh_ask", "mesh_free_image_to_3d", "mesh_validate"})
+        prompt_template = _SYSTEM_PROMPT_BASE
+        if has_mesh_tools:
+            prompt_template += _SYSTEM_PROMPT_MESH_ADDON
+        system_prompt = prompt_template.format(
             tool_catalogue=self.registry.describe_all()
         )
         messages: List[Dict[str, str]] = [

@@ -59,9 +59,16 @@ from .ai_integrations import (
     LMStudioClient,
     ComfyUIClient,
     SDWebUIClient,
+    KoboldCppClient,
+    TabbyAPIClient,
+    GPT4AllClient,
+    AphroditeClient,
+    AIAppRegistry,
     AIAppStatus,
     OllamaModel,
     GenerateResult,
+    SDImage,
+    ComfyUIJob,
 )
 
 # ---------------------------------------------------------------------------
@@ -146,7 +153,9 @@ __all__ = [
     "ToolRegistry", "Tool", "ToolParam", "ToolResult",
     # AI integrations
     "OllamaClient", "LMStudioClient", "ComfyUIClient", "SDWebUIClient",
-    "AIAppStatus", "OllamaModel", "GenerateResult",
+    "KoboldCppClient", "TabbyAPIClient", "GPT4AllClient", "AphroditeClient",
+    "AIAppRegistry", "AIAppStatus", "OllamaModel", "GenerateResult",
+    "SDImage", "ComfyUIJob",
     # Mesh (conditional)
     "MeshEngine", "FreeImage3DClient", "FreeImage3DResult",
     "FREE_IMAGE_TO_3D_BACKENDS", "HuggingFaceDepthEstimator",
@@ -154,9 +163,11 @@ __all__ = [
     "MeshValidator", "ValidationResult",
     # GPU (conditional)
     "GpuMonitor", "GpuSnapshot",
-    # Gemma (conditional)
-    "GemmaFineTuner", "FineTuneConfig", "GPUMemoryProfiler",
+    # Fine-tuning (conditional)
+    "GemmaFineTuner", "UnslothFineTuner",
+    "FineTuneConfig", "GPUMemoryProfiler",
     "GEMMA_MODELS", "TrainingResult", "InferenceResult",
+    "prepare_mossy_dataset", "list_recommended_models",
     # Availability flags
     "_MESH_AVAILABLE", "_GPU_AVAILABLE", "_GEMMA_AVAILABLE",
 ]

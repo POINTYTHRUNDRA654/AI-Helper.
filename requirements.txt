@@ -1,17 +1,28 @@
-psutil>=5.9.0
-pyttsx3>=2.90
-pynput>=1.8.1
-pyperclip>=1.11.0
+# ---------------------------------------------------------------------------
+# Core runtime — always required
+# ---------------------------------------------------------------------------
+psutil>=5.9.0               # CPU / memory / disk / process monitoring
+pyttsx3>=2.90               # offline text-to-speech (SAPI5 / eSpeak / NSSpeechSynthesizer)
+pynput>=1.8.1               # global hotkey listener
+pyperclip>=1.11.0           # clipboard read / write
 
-# Gemma 4 fine-tuning with Unsloth
-torch>=2.0.0
-transformers>=4.40.0
-unsloth[colab-new]>=2024.1
-datasets>=2.14.0
-trl>=0.7.0
-bitsandbytes>=0.41.0
-peft>=0.7.0
-accelerate>=0.25.0
+# ---------------------------------------------------------------------------
+# Gemma / LLM fine-tuning and inference
+# All models are free and downloaded from HuggingFace on first use.
+# Supports: Gemma 4, Phi-4, LLaMA 3.x, Mistral, Qwen 2.5
+# ---------------------------------------------------------------------------
+torch>=2.0.0                # PyTorch — GPU tensor computation
+transformers>=4.40.0        # HuggingFace Transformers — model loading / inference
+datasets>=2.14.0            # HuggingFace Datasets — training data handling
+trl>=0.7.0                  # SFTTrainer for instruction fine-tuning
+bitsandbytes>=0.41.0        # 4-bit / 8-bit quantisation (load large models on 8 GB VRAM)
+peft>=0.7.0                 # LoRA / QLoRA adapters — parameter-efficient fine-tuning
+accelerate>=0.25.0          # multi-GPU / mixed-precision training helper
+# Unsloth: 2× faster training, 60% less VRAM.  Install the variant matching your CUDA version:
+#   pip install "unsloth[cu121]"   # CUDA 12.1
+#   pip install "unsloth[cu118]"   # CUDA 11.8
+#   pip install "unsloth[cpu]"     # CPU-only (slower)
+# unsloth>=2024.1            # commented out — install manually with the right CUDA suffix above
 
 # ---------------------------------------------------------------------------
 # Mesh engine — image scanning and Fallout 4 mesh conversion
@@ -23,20 +34,20 @@ opencv-python>=4.8.0        # image loading, feature detection SIFT/ORB   (githu
 open3d>=0.18.0              # point cloud + Poisson mesh reconstruction     (github: isl-org/Open3D)
 trimesh>=4.0.0              # mesh I/O and format conversion                (github: mikedh/trimesh)
 numpy>=1.24.0               # numerical computing
-Pillow>=10.0.0              # image loading
+Pillow>=10.0.0              # image loading and manipulation
 scipy>=1.11.0               # scientific computing (used by trimesh)
-scikit-image>=0.21.0        # image processing utilities (used by TripoSG)
+scikit-image>=0.21.0        # image processing utilities (used by TripoSG / InstantMesh)
 pyffi>=2.2.4.dev3           # NIF file format I/O for Fallout 4            (github: niftools/pyffi)
 
 # HuggingFace ecosystem — free model downloads and inference pipelines
-# (torch + transformers already listed above for Gemma)
-diffusers>=0.27.0           # HF diffusion pipelines (TripoSG, TRELLIS, etc.) (github: huggingface/diffusers)
+# (torch + transformers already listed above for LLM fine-tuning)
+diffusers>=0.27.0           # HF diffusion pipelines (TripoSG, TRELLIS, etc.)
 einops>=0.7.0               # tensor rearrangement, required by most vision models
 omegaconf>=2.3.0            # config management for TripoSG / InstantMesh
 huggingface_hub>=0.20.0     # model downloads from HuggingFace Hub
 
-# Utility
-requests>=2.32.0            # HTTP client (used by HF hub, model downloaders)
-tqdm>=4.66.0                # progress bars during model inference / downloads
+# Utilities
+requests>=2.32.0            # HTTP client (used by HF hub and model downloaders)
+tqdm>=4.66.0                # progress bars during model inference and downloads
 pymeshlab>=2023.12          # mesh processing and polygon reduction         (github: cnr-isti-vclab/meshlab)
-moderngl>=5.10.0            # OpenGL rendering (texture baking for TripoSR)
+moderngl>=5.10.0            # OpenGL rendering (texture baking for TripoSR / InstantMesh)
